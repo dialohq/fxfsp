@@ -65,6 +65,29 @@ fn is_data_block_magic(magic: u32, version: FormatVersion) -> bool {
     }
 }
 
+fn is_block_format(magic: u32) -> bool {
+    magic == XFS_DIR2_BLOCK_MAGIC || magic == XFS_DIR3_BLOCK_MAGIC
+}
+
+/// Compute the end-of-data-entries offset for a directory block.
+/// For block-format directories (XD2B/XDB3), the block contains:
+///   [header][data entries...][leaf entries...][block_tail (8 bytes)]
+/// The tail has { u32 count, u32 stale }, and leaf entries (8 bytes each)
+/// immediately precede the tail. Data entries end before the leaf section.
+/// For data-format directories (XD2D/XDD3), the entire block is data entries.
+fn data_end_offset(buf: &[u8], magic: u32) -> usize {
+    if is_block_format(magic) && buf.len() >= 8 {
+        let tail_offset = buf.len() - 8;
+        let leaf_count = u32::from_be_bytes(
+            buf[tail_offset..tail_offset + 4].try_into().unwrap(),
+        ) as usize;
+        // Each leaf entry is 8 bytes (u32 hashval + u32 address).
+        tail_offset.saturating_sub(leaf_count * 8)
+    } else {
+        buf.len()
+    }
+}
+
 /// Parse directory data entries from a data block.
 /// `buf` is a single directory block (block_size or dir_blk_size bytes).
 /// `parent_ino` is the inode owning this directory.
@@ -89,10 +112,10 @@ where
     }
 
     let hdr_size = data_hdr_size(ctx.version);
-    let block_len = buf.len();
+    let data_end = data_end_offset(buf, magic);
     let mut offset = hdr_size;
 
-    while offset + 6 <= block_len {
+    while offset + 6 <= data_end {
         // Each entry starts with either a used entry or a free (unused) entry.
         // Free entries have a 2-byte freetag (0xffff) + 2-byte length.
         let freetag = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
@@ -100,7 +123,7 @@ where
         if freetag == XFS_DIR2_DATA_FREE_TAG {
             // Unused entry: 2-byte tag + 2-byte length.
             let length = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-            if length == 0 || offset + length > block_len {
+            if length == 0 || offset + length > data_end {
                 break;
             }
             offset += length;
@@ -115,7 +138,7 @@ where
         // - padding to 8-byte boundary
         // - U16 tag (2 bytes, offset of this entry from block start)
 
-        if offset + 9 > block_len {
+        if offset + 9 > data_end {
             break;
         }
 
@@ -124,13 +147,13 @@ where
 
         let name_start = offset + 9;
         let name_end = name_start + namelen;
-        if name_end > block_len {
+        if name_end > data_end {
             break;
         }
 
         let name = &buf[name_start..name_end];
 
-        let ftype = if ctx.has_ftype && name_end < block_len {
+        let ftype = if ctx.has_ftype && name_end < data_end {
             buf[name_end]
         } else {
             0

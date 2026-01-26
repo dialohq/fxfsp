@@ -1,4 +1,5 @@
 pub mod ag;
+pub mod bmbt;
 pub mod btree;
 pub mod dir;
 pub mod extent;

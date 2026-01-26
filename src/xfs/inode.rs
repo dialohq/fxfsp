@@ -85,6 +85,8 @@ pub struct InodeInfo {
     pub nblocks: u64,
     /// Byte offset of the data fork within the on-disk inode.
     pub data_fork_offset: usize,
+    /// Size of the data fork in bytes (up to attr fork or end of inode).
+    pub data_fork_size: usize,
 }
 
 impl InodeInfo {
@@ -105,11 +107,13 @@ impl InodeInfo {
 /// `ino` is the absolute inode number (for the returned InodeInfo).
 /// `is_v5` selects V4 vs V5 core size.
 /// `has_nrext64`: if true, extent count is a U64 at inode byte offset 24.
+/// `inode_size`: on-disk inode size in bytes (from superblock).
 pub fn parse_inode_core(
     buf: &[u8],
     ino: u64,
     is_v5: bool,
     has_nrext64: bool,
+    inode_size: u16,
 ) -> Result<InodeInfo, FxfspError> {
     let core = XfsDinodeCore::ref_from_prefix(buf)
         .map_err(|_| FxfspError::Parse("buffer too small for dinode core"))?
@@ -120,6 +124,15 @@ pub fn parse_inode_core(
     }
 
     let data_fork_offset = if is_v5 { V5_CORE_SIZE } else { V4_CORE_SIZE };
+
+    // Data fork size: if di_forkoff > 0, the attr fork starts at
+    // data_fork_offset + di_forkoff*8. Otherwise the data fork extends
+    // to the end of the inode.
+    let data_fork_size = if core.di_forkoff > 0 {
+        core.di_forkoff as usize * 8
+    } else {
+        inode_size as usize - data_fork_offset
+    };
 
     // With NREXT64, di_nextents (offset 76) is zeroed; the actual data fork
     // extent count is stored as the lower 48 bits of a U64 at inode byte
@@ -152,5 +165,6 @@ pub fn parse_inode_core(
         ctime_nsec: core.di_ctime.t_nsec.get(),
         nblocks: core.di_nblocks.get(),
         data_fork_offset,
+        data_fork_size,
     })
 }

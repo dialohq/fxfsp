@@ -1,10 +1,9 @@
-use zerocopy::FromBytes;
-
 use crate::api::FsEvent;
 use crate::error::FxfspError;
 use crate::io::aligned_buf::IO_ALIGN;
 use crate::io::engine::IoEngine;
 use crate::xfs::ag::AgiInfo;
+use crate::xfs::bmbt::collect_bmbt_extents;
 use crate::xfs::btree::collect_inobt_records;
 use crate::xfs::dir::block::parse_dir_data_block;
 use crate::xfs::dir::shortform::parse_shortform_dir;
@@ -15,11 +14,15 @@ use crate::xfs::inode::{
 };
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
-/// Default gap-fill threshold in filesystem blocks.
-/// If two extents are separated by fewer than this many blocks,
-/// read through the gap instead of seeking.
-/// ~256 blocks at 4K = 1 MiB.
-const GAP_FILL_BLOCKS: u64 = 256;
+/// Gap-fill threshold in filesystem blocks for directory extent coalescing.
+/// With 32 GB of RAM we can afford aggressive gap-fill. 4096 blocks at 4K = 16 MiB.
+const GAP_FILL_BLOCKS: u64 = 4096;
+
+/// Maximum gap (bytes) between inode chunks before starting a new batch read.
+const INODE_BATCH_GAP: u64 = 16 * 1024 * 1024; // 16 MiB
+
+/// Maximum batch read size for inode chunks.
+const INODE_BATCH_MAX: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// A deferred directory work item: inode + its data extents.
 struct DirWorkItem {
@@ -27,20 +30,24 @@ struct DirWorkItem {
     extents: Vec<Extent>,
 }
 
+/// Deferred btree-format directory: we need the engine to walk the bmbt.
+struct BtreeDirItem {
+    ino: u64,
+    fork_data: Vec<u8>,
+    data_fork_size: usize,
+}
+
 /// A coalesced read range (in absolute filesystem blocks).
 struct ReadRange {
     start_block: u64,
     block_count: u64,
-    /// Which directory work items and which extents overlap this range.
     entries: Vec<DirRangeEntry>,
 }
 
 /// Tracks a directory extent within a coalesced read range.
 struct DirRangeEntry {
     ino: u64,
-    /// Offset within the read range buffer where this extent's data starts.
     buf_offset: usize,
-    /// Number of bytes for this extent.
     byte_len: usize,
 }
 
@@ -84,7 +91,6 @@ where
 {
     // ---- Read AGI header (at sector offset 2 within the AG) ----
     let agi_offset = ctx.agi_byte_offset(agno);
-    // AGI might not be block-aligned; read the entire block containing it.
     let agi_block_offset = agi_offset & !(ctx.block_size as u64 - 1);
     let agi_read_size = align_up(ctx.block_size as usize, IO_ALIGN);
     let agi_buf = engine.read_at(agi_block_offset, agi_read_size)?;
@@ -92,71 +98,94 @@ where
     let agi = AgiInfo::from_buf(&agi_buf[agi_within_block..], agno, ctx.version)?;
 
     // ---- Phase 1a: Collect all inobt records ----
-    let mut inobt_records = collect_inobt_records(engine, ctx, agno, agi.inobt_root, agi.inobt_level)?;
+    let mut inobt_records =
+        collect_inobt_records(engine, ctx, agno, agi.inobt_root, agi.inobt_level)?;
 
-    // ---- Phase 1b: Sort by physical offset, read sequentially ----
+    // ---- Phase 1b: Sort by physical offset ----
     inobt_records.sort_by_key(|r| r.start_ino());
 
+    // ---- Phase 1c: Batched inode reads ----
+    // Pre-compute chunk byte ranges.
+    let chunk_blocks = 64usize * ctx.inode_size as usize / ctx.block_size as usize;
+    let chunk_byte_len = chunk_blocks * ctx.block_size as usize;
+
+    struct ChunkMeta {
+        byte_offset: u64,
+        rec_idx: usize,
+    }
+
+    let chunks: Vec<ChunkMeta> = inobt_records
+        .iter()
+        .enumerate()
+        .map(|(idx, rec)| {
+            let chunk_ag_block = rec.start_ino() / ctx.inodes_per_block as u32;
+            ChunkMeta {
+                byte_offset: ctx.ag_block_to_byte(agno, chunk_ag_block),
+                rec_idx: idx,
+            }
+        })
+        .collect();
+
     let mut dir_work: Vec<DirWorkItem> = Vec::new();
+    let mut btree_dirs: Vec<BtreeDirItem> = Vec::new();
 
-    for rec in &inobt_records {
-        let start_agino = rec.start_ino();
-        // Inode chunk: up to 64 inodes. Physical location is determined by agino.
-        // agino / inodes_per_block = AG block offset of the inode.
-        let chunk_ag_block = start_agino / ctx.inodes_per_block as u32;
-        let chunk_byte_offset = ctx.ag_block_to_byte(agno, chunk_ag_block);
+    // Process chunks in batches.
+    let mut batch_start_idx = 0;
+    while batch_start_idx < chunks.len() {
+        let batch_start_byte = chunks[batch_start_idx].byte_offset;
+        let mut batch_end_byte = batch_start_byte + chunk_byte_len as u64;
+        let mut batch_end_idx = batch_start_idx + 1;
 
-        // Number of inodes in this chunk.
-        let chunk_ino_count = rec.ir_count as u32;
-        // Number of blocks to read for this chunk.
-        let blocks_needed =
-            (chunk_ino_count as usize * ctx.inode_size as usize + ctx.block_size as usize - 1)
-                / ctx.block_size as usize;
-        let read_size = align_up(blocks_needed * ctx.block_size as usize, IO_ALIGN);
-        let chunk_buf = engine.read_at(chunk_byte_offset, read_size)?;
+        // Extend batch with nearby chunks.
+        while batch_end_idx < chunks.len() {
+            let next_start = chunks[batch_end_idx].byte_offset;
+            let gap = next_start.saturating_sub(batch_end_byte);
+            let total_span = next_start + chunk_byte_len as u64 - batch_start_byte;
+            if gap <= INODE_BATCH_GAP && total_span <= INODE_BATCH_MAX {
+                batch_end_byte = next_start + chunk_byte_len as u64;
+                batch_end_idx += 1;
+            } else {
+                break;
+            }
+        }
 
-        for i in 0..chunk_ino_count {
-            if !rec.is_allocated(i) {
+        // Read the entire batch range.
+        let read_len = align_up((batch_end_byte - batch_start_byte) as usize, IO_ALIGN);
+        let buf = engine.read_at(batch_start_byte, read_len)?;
+
+        // Process each chunk within this batch.
+        for chunk in &chunks[batch_start_idx..batch_end_idx] {
+            let buf_offset = (chunk.byte_offset - batch_start_byte) as usize;
+            if buf_offset + chunk_byte_len > buf.len() {
+                // Near end of device, skip partial chunk.
                 continue;
             }
+            let chunk_buf = &buf[buf_offset..buf_offset + chunk_byte_len];
+            let rec = &inobt_records[chunk.rec_idx];
 
-            let agino = start_agino + i;
-            let abs_ino = ctx.agino_to_ino(agno, agino);
-            let inode_offset_in_chunk = i as usize * ctx.inode_size as usize;
+            process_inode_chunk(
+                chunk_buf,
+                rec,
+                agno,
+                ctx,
+                is_v5,
+                callback,
+                &mut dir_work,
+                &mut btree_dirs,
+            )?;
+        }
 
-            if inode_offset_in_chunk + ctx.inode_size as usize > chunk_buf.len() {
-                return Err(FxfspError::Parse("inode offset out of chunk bounds"));
-            }
+        batch_start_idx = batch_end_idx;
+    }
 
-            let inode_buf = &chunk_buf[inode_offset_in_chunk..];
-            let info = parse_inode_core(inode_buf, abs_ino, is_v5, ctx.has_nrext64)?;
-
-            callback(&FsEvent::InodeFound {
-                ino: info.ino,
-                mode: info.mode,
-                size: info.size,
-                uid: info.uid,
-                gid: info.gid,
-                nlink: info.nlink,
-                mtime_sec: info.mtime_sec,
-                mtime_nsec: info.mtime_nsec,
-                atime_sec: info.atime_sec,
-                atime_nsec: info.atime_nsec,
-                ctime_sec: info.ctime_sec,
-                ctime_nsec: info.ctime_nsec,
-                nblocks: info.nblocks,
+    // ---- Phase 1.5: Walk bmbt trees for btree-format directories ----
+    for item in btree_dirs {
+        let extents = collect_bmbt_extents(engine, ctx, &item.fork_data, item.data_fork_size)?;
+        if !extents.is_empty() {
+            dir_work.push(DirWorkItem {
+                ino: item.ino,
+                extents,
             });
-
-            if info.is_dir() {
-                handle_directory(
-                    inode_buf,
-                    &info,
-                    ctx,
-                    is_v5,
-                    callback,
-                    &mut dir_work,
-                )?;
-            }
         }
     }
 
@@ -168,21 +197,79 @@ where
     Ok(())
 }
 
-/// Handle a directory inode: parse shortform inline, or defer extents to Phase 2.
+/// Process all allocated inodes in a single inobt chunk.
+fn process_inode_chunk<F>(
+    chunk_buf: &[u8],
+    rec: &crate::xfs::btree::XfsInobtRec,
+    agno: u32,
+    ctx: &FsContext,
+    is_v5: bool,
+    callback: &mut F,
+    dir_work: &mut Vec<DirWorkItem>,
+    btree_dirs: &mut Vec<BtreeDirItem>,
+) -> Result<(), FxfspError>
+where
+    F: FnMut(&FsEvent),
+{
+    let start_agino = rec.start_ino();
+
+    for i in 0..64u32 {
+        // Skip holes (sparse inode chunks) and free inodes.
+        let group = i / 4;
+        let is_hole = (rec.ir_holemask.get() & (1u16 << group)) != 0;
+        if is_hole || !rec.is_allocated(i) {
+            continue;
+        }
+
+        let agino = start_agino + i;
+        let abs_ino = ctx.agino_to_ino(agno, agino);
+        let inode_offset = i as usize * ctx.inode_size as usize;
+
+        if inode_offset + ctx.inode_size as usize > chunk_buf.len() {
+            break;
+        }
+
+        let inode_buf = &chunk_buf[inode_offset..];
+        let info = parse_inode_core(inode_buf, abs_ino, is_v5, ctx.has_nrext64, ctx.inode_size)?;
+
+        callback(&FsEvent::InodeFound {
+            ino: info.ino,
+            mode: info.mode,
+            size: info.size,
+            uid: info.uid,
+            gid: info.gid,
+            nlink: info.nlink,
+            mtime_sec: info.mtime_sec,
+            mtime_nsec: info.mtime_nsec,
+            atime_sec: info.atime_sec,
+            atime_nsec: info.atime_nsec,
+            ctime_sec: info.ctime_sec,
+            ctime_nsec: info.ctime_nsec,
+            nblocks: info.nblocks,
+        });
+
+        if info.is_dir() {
+            handle_directory(inode_buf, &info, ctx, callback, dir_work, btree_dirs)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a directory inode: parse shortform inline, or defer to Phase 2.
 fn handle_directory<F>(
     inode_buf: &[u8],
     info: &InodeInfo,
     ctx: &FsContext,
-    _is_v5: bool,
     callback: &mut F,
     dir_work: &mut Vec<DirWorkItem>,
+    btree_dirs: &mut Vec<BtreeDirItem>,
 ) -> Result<(), FxfspError>
 where
     F: FnMut(&FsEvent),
 {
     match info.format {
         XFS_DINODE_FMT_LOCAL => {
-            // Shortform directory -- parse inline now.
             let fork_start = info.data_fork_offset;
             let fork_end = fork_start + info.size as usize;
             if fork_end > inode_buf.len() {
@@ -200,72 +287,19 @@ where
             });
         }
         XFS_DINODE_FMT_BTREE => {
-            // B-tree format: we need to walk the data fork B-tree to get extents.
-            // For now, collect extents from the B-tree root block in the data fork.
-            let fork_buf = &inode_buf[info.data_fork_offset..];
-            let extents = parse_bmbt_root(fork_buf, ctx, info)?;
-            dir_work.push(DirWorkItem {
+            // Save a copy of the fork data for the bmbt walk in phase 1.5.
+            let fork_start = info.data_fork_offset;
+            let fork_end = (fork_start + info.data_fork_size).min(inode_buf.len());
+            let fork_data = inode_buf[fork_start..fork_end].to_vec();
+            btree_dirs.push(BtreeDirItem {
                 ino: info.ino,
-                extents,
+                fork_data,
+                data_fork_size: info.data_fork_size,
             });
         }
-        _ => {
-            // Other formats (DEV, UUID) don't have directory data.
-        }
+        _ => {}
     }
     Ok(())
-}
-
-/// Parse B-tree root in the inode data fork to extract extents.
-/// The root block is stored inline in the inode's data fork.
-fn parse_bmbt_root(
-    fork_buf: &[u8],
-    _ctx: &FsContext,
-    _info: &InodeInfo,
-) -> Result<Vec<Extent>, FxfspError> {
-    // The data fork contains a bmbt block:
-    // - U16 bb_level
-    // - U16 bb_numrecs
-    // - keys[numrecs] (each 8 bytes: file offset)
-    // - ptrs[numrecs] (each 8 bytes: fsblock)
-    //
-    // For directory inodes with BTREE format, the actual data extents are
-    // in leaf nodes. We'd need to read those blocks to get the full extent list.
-    // For the first version, we only support extents that fit in the root.
-    // A proper implementation would walk the B-tree levels.
-
-    if fork_buf.len() < 4 {
-        return Err(FxfspError::Parse("bmbt root too small"));
-    }
-
-    let level = u16::from_be_bytes([fork_buf[0], fork_buf[1]]);
-    let numrecs = u16::from_be_bytes([fork_buf[2], fork_buf[3]]) as usize;
-
-    if level == 0 {
-        // Leaf-level root: records are XfsBmbtRec (16 bytes each).
-        let rec_start = 4;
-        let rec_size = 16;
-        let mut extents = Vec::with_capacity(numrecs);
-        for i in 0..numrecs {
-            let offset = rec_start + i * rec_size;
-            if offset + rec_size > fork_buf.len() {
-                break;
-            }
-            let rec = <crate::xfs::extent::XfsBmbtRec as FromBytes>::ref_from_prefix(&fork_buf[offset..])
-                .map_err(|_| FxfspError::Parse("bmbt leaf record parse failed"))?
-                .0;
-            extents.push(rec.unpack());
-        }
-        Ok(extents)
-    } else {
-        // Interior root: keys (8 bytes each) then pointers (8 bytes each).
-        // We'd need to read child blocks. For now, return empty -- this means
-        // very large directories with deep B-trees won't have their entries
-        // emitted in this version. A TODO for proper B-tree descent.
-        //
-        // TODO: Walk child blocks for full btree directory support.
-        Ok(Vec::new())
-    }
 }
 
 /// Phase 2: Sort directory extents, merge/gap-fill, read sequentially, parse.
@@ -278,7 +312,6 @@ fn phase2_dir_sweep<F>(
 where
     F: FnMut(&FsEvent),
 {
-    // Flatten all extents with their owning inode.
     let mut all_extents: Vec<(u64, &Extent)> = Vec::new();
     for item in dir_work {
         for ext in &item.extents {
@@ -288,26 +321,35 @@ where
         }
     }
 
-    // Sort by physical start block.
     all_extents.sort_by_key(|&(_, ext)| ext.start_block);
 
-    // Build coalesced read ranges with gap-filling.
     let ranges = coalesce_extents(&all_extents, ctx);
+    let device_blocks = engine.device_size() >> ctx.block_log as u64;
 
-    // Read each range and parse directory data blocks.
     for range in &ranges {
+        // Skip ranges that extend past the device.
+        if range.start_block >= device_blocks {
+            continue;
+        }
+        let clamped_blocks = range.block_count.min(device_blocks - range.start_block);
+
         let byte_offset = range.start_block << ctx.block_log as u64;
-        let byte_len = (range.block_count as usize) << ctx.block_log as usize;
+        let byte_len = (clamped_blocks as usize) << ctx.block_log as usize;
         let read_size = align_up(byte_len, IO_ALIGN);
 
         let buf = engine.read_at(byte_offset, read_size)?;
 
-        // Parse each directory extent within this range.
         for entry in &range.entries {
-            let dir_blk_size = ctx.dir_blk_size() as usize;
-            let extent_buf = &buf[entry.buf_offset..entry.buf_offset + entry.byte_len];
+            // Clamp entry to what we actually read.
+            let entry_end = entry.buf_offset + entry.byte_len;
+            if entry.buf_offset >= buf.len() {
+                continue;
+            }
+            let clamped_end = entry_end.min(buf.len());
 
-            // A directory extent may contain multiple directory blocks.
+            let dir_blk_size = ctx.dir_blk_size() as usize;
+            let extent_buf = &buf[entry.buf_offset..clamped_end];
+
             let mut off = 0;
             while off + dir_blk_size <= extent_buf.len() {
                 let block_buf = &extent_buf[off..off + dir_blk_size];
@@ -337,7 +379,6 @@ fn coalesce_extents(extents: &[(u64, &Extent)], ctx: &FsContext) -> Vec<ReadRang
             let gap = ext_start.saturating_sub(last_end);
 
             if gap <= GAP_FILL_BLOCKS {
-                // Extend the current range to include this extent (plus gap).
                 let new_end = ext_start + ext_blocks;
                 last.block_count = new_end - last.start_block;
                 let buf_offset =
@@ -351,7 +392,6 @@ fn coalesce_extents(extents: &[(u64, &Extent)], ctx: &FsContext) -> Vec<ReadRang
             }
         }
 
-        // Start a new range.
         ranges.push(ReadRange {
             start_block: ext_start,
             block_count: ext_blocks,
