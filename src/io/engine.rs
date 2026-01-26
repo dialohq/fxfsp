@@ -254,6 +254,64 @@ impl IoEngine {
 
         Ok(&self.buf[..total])
     }
+
+    /// Read with coalescing: merge sorted requests whose gaps fall within
+    /// `disk_profile.merge_gap` into larger sequential reads.
+    ///
+    /// On rotational media this trades extra bytes read for far fewer seeks.
+    /// `requests` **must** be sorted by offset (ascending).
+    pub fn coalesced_read_batch<T: Copy, F>(
+        &mut self,
+        requests: &[(u64, usize, T)],
+        mut on_complete: F,
+    ) -> Result<(), FxfspError>
+    where
+        F: FnMut(&[u8], T) -> Result<(), FxfspError>,
+    {
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let merge_gap = self.disk_profile.merge_gap;
+        let mut group_start = requests[0].0;
+        let mut group_end = requests[0].0 + requests[0].1 as u64;
+        let mut sub_start = 0usize;
+
+        for i in 1..=requests.len() {
+            let flush = if i < requests.len() {
+                requests[i].0.saturating_sub(group_end) > merge_gap as u64
+            } else {
+                true
+            };
+
+            if flush {
+                let merged_len = (group_end - group_start) as usize;
+                let buf = self.read_at(group_start, merged_len)?;
+
+                for j in sub_start..i {
+                    let (offset, len, tag) = requests[j];
+                    let rel = (offset - group_start) as usize;
+                    let end = (rel + len).min(buf.len());
+                    if rel < buf.len() {
+                        on_complete(&buf[rel..end], tag)?;
+                    }
+                }
+
+                if i < requests.len() {
+                    group_start = requests[i].0;
+                    group_end = requests[i].0 + requests[i].1 as u64;
+                    sub_start = i;
+                }
+            } else {
+                let new_end = requests[i].0 + requests[i].1 as u64;
+                if new_end > group_end {
+                    group_end = new_end;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ---- Batch read: io_uring on Linux, pread fallback elsewhere ----

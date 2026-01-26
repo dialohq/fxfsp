@@ -117,7 +117,7 @@ where
         .collect();
 
     engine.set_phase("inode_chunks");
-    engine.read_batch(&requests, |buf, idx| {
+    engine.coalesced_read_batch(&requests, |buf, idx| {
         let rec = &inobt_records[chunks[idx].rec_idx];
         process_inode_chunk(buf, rec, agno, ctx, is_v5, callback, &mut dir_work, &mut btree_dirs)
     })?;
@@ -275,7 +275,7 @@ where
 
     let dir_blk_size = ctx.dir_blk_size() as usize;
 
-    engine.read_batch(&requests, |buf, ino| {
+    engine.coalesced_read_batch(&requests, |buf, ino| {
         let mut off = 0;
         while off + dir_blk_size <= buf.len() {
             parse_dir_data_block(&buf[off..off + dir_blk_size], ino, ctx, callback)?;
