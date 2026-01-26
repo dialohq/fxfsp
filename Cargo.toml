@@ -1,0 +1,14 @@
+[package]
+name = "fxfsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }
+aligned-vec = "0.6"
+thiserror = "2"
+crc32c = "0.6"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
