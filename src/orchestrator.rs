@@ -14,15 +14,17 @@ use crate::xfs::inode::{
 };
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
-/// Only merge strictly adjacent extents (gap = 0). We know the exact blocks
-/// we need — reading through gaps wastes I/O on file data we don't care about.
-const GAP_FILL_BLOCKS: u64 = 0;
+/// Maximum gap (in filesystem blocks) between directory extents before
+/// starting a new read.  On HDD the break-even is seek_time × throughput
+/// ≈ 10 ms × 273 MB/s ≈ 2.7 MB.  At 4 K blocks that is ~680 blocks;
+/// we round to 512 (2 MiB).
+const GAP_FILL_BLOCKS: u64 = 512;
 
 /// Maximum gap (bytes) between inode chunks before starting a new batch read.
-/// Set to 0: only merge physically adjacent chunks.  With ~100K ranges per AG
-/// the syscall overhead (~15 s) is far less than the I/O cost of reading gap
-/// data (~275 KB avg gap × 390K chunks ≈ 100+ GB of junk per AG).
-const INODE_BATCH_GAP: u64 = 0;
+/// Inode chunks are dense within the AG (avg gap ~275 KB).  16 MiB merges
+/// them into large sequential reads with minimal junk because the chunks
+/// are closely spaced.
+const INODE_BATCH_GAP: u64 = 16 * 1024 * 1024; // 16 MiB
 
 /// Maximum batch read size for inode chunks.
 const INODE_BATCH_MAX: u64 = 256 * 1024 * 1024; // 256 MiB
