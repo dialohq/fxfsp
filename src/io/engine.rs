@@ -256,9 +256,12 @@ impl IoEngine {
     }
 
     /// Read with coalescing: merge sorted requests whose gaps fall within
-    /// `disk_profile.merge_gap` into larger sequential reads.
+    /// `disk_profile.merge_gap` into larger sequential reads, then submit
+    /// the merged reads through `read_batch` (io_uring on Linux).
     ///
-    /// On rotational media this trades extra bytes read for far fewer seeks.
+    /// Each merged read is capped at `max_merged_bytes` so the io_uring
+    /// buffer pool stays bounded.
+    ///
     /// `requests` **must** be sorted by offset (ascending).
     pub fn coalesced_read_batch<T: Copy, F>(
         &mut self,
@@ -273,42 +276,72 @@ impl IoEngine {
         }
 
         let merge_gap = self.disk_profile.merge_gap;
-        let mut group_start = requests[0].0;
-        let mut group_end = requests[0].0 + requests[0].1 as u64;
+        // Cap each merged read so io_uring buffer pool stays reasonable.
+        // 16 MiB × 128 queue depth = 2 GiB worst-case pool.
+        const MAX_MERGED: usize = 16 * 1024 * 1024;
+
+        // ---- Build merged groups ----
+        struct MergedGroup {
+            offset: u64,
+            len: usize,
+            sub_start: usize, // index into `requests`
+            sub_end: usize,   // exclusive
+        }
+
+        let mut groups: Vec<MergedGroup> = Vec::new();
+        let mut g_start = requests[0].0;
+        let mut g_end = requests[0].0 + requests[0].1 as u64;
         let mut sub_start = 0usize;
 
         for i in 1..=requests.len() {
             let flush = if i < requests.len() {
-                requests[i].0.saturating_sub(group_end) > merge_gap as u64
+                let gap = requests[i].0.saturating_sub(g_end);
+                let new_end = requests[i].0 + requests[i].1 as u64;
+                let new_len = (new_end - g_start) as usize;
+                gap > merge_gap as u64 || new_len > MAX_MERGED
             } else {
                 true
             };
 
             if flush {
-                let merged_len = (group_end - group_start) as usize;
-                let buf = self.read_at(group_start, merged_len)?;
-
-                for j in sub_start..i {
-                    let (offset, len, tag) = requests[j];
-                    let rel = (offset - group_start) as usize;
-                    let end = (rel + len).min(buf.len());
-                    if rel < buf.len() {
-                        on_complete(&buf[rel..end], tag)?;
-                    }
-                }
-
+                groups.push(MergedGroup {
+                    offset: g_start,
+                    len: (g_end - g_start) as usize,
+                    sub_start,
+                    sub_end: i,
+                });
                 if i < requests.len() {
-                    group_start = requests[i].0;
-                    group_end = requests[i].0 + requests[i].1 as u64;
+                    g_start = requests[i].0;
+                    g_end = requests[i].0 + requests[i].1 as u64;
                     sub_start = i;
                 }
             } else {
                 let new_end = requests[i].0 + requests[i].1 as u64;
-                if new_end > group_end {
-                    group_end = new_end;
+                if new_end > g_end {
+                    g_end = new_end;
                 }
             }
         }
+
+        // ---- Submit merged groups through read_batch ----
+        let merged_requests: Vec<(u64, usize, usize)> = groups
+            .iter()
+            .enumerate()
+            .map(|(gi, g)| (g.offset, g.len, gi))
+            .collect();
+
+        self.read_batch(&merged_requests, |buf, gi| {
+            let g = &groups[gi];
+            for j in g.sub_start..g.sub_end {
+                let (offset, len, tag) = requests[j];
+                let rel = (offset - g.offset) as usize;
+                let end = (rel + len).min(buf.len());
+                if rel < buf.len() {
+                    on_complete(&buf[rel..end], tag)?;
+                }
+            }
+            Ok(())
+        })?;
 
         Ok(())
     }
