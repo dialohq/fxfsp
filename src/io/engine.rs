@@ -6,6 +6,111 @@ use crate::error::FxfspError;
 use crate::io::aligned_buf::{AlignedBuf, IO_ALIGN, alloc_aligned};
 use crate::io::platform::{configure_direct_io, direct_open_flags};
 
+/// Physical characteristics of the underlying block device.
+pub struct DiskProfile {
+    pub is_rotational: bool,
+    pub max_io_bytes: usize,
+    pub merge_gap: usize,
+}
+
+impl Default for DiskProfile {
+    fn default() -> Self {
+        Self {
+            is_rotational: true,
+            max_io_bytes: 1024 * 1024,
+            merge_gap: 1024 * 1024,
+        }
+    }
+}
+
+impl std::fmt::Display for DiskProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Disk: rotational={} max_io={} merge_gap={}",
+            self.is_rotational, self.max_io_bytes, self.merge_gap
+        )
+    }
+}
+
+/// Detect disk profile from an open file descriptor by reading sysfs.
+/// Never fails — returns conservative defaults on any error.
+#[cfg(target_os = "linux")]
+fn detect_disk_profile(fd: RawFd) -> DiskProfile {
+    use std::fs;
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return DiskProfile::default();
+    }
+
+    let rdev = stat.st_rdev;
+    let major = unsafe { libc::major(rdev) };
+    let minor = unsafe { libc::minor(rdev) };
+
+    // Not a block device (regular file, etc.) — use defaults.
+    if major == 0 && minor == 0 {
+        return DiskProfile::default();
+    }
+
+    let base = format!("/sys/dev/block/{}:{}", major, minor);
+
+    // Try direct queue path first, then parent (for partitions).
+    let read_queue_file = |name: &str| -> Option<String> {
+        let direct = format!("{}/queue/{}", base, name);
+        if let Ok(v) = fs::read_to_string(&direct) {
+            return Some(v.trim().to_string());
+        }
+        let parent = format!("{}/../queue/{}", base, name);
+        fs::read_to_string(&parent).ok().map(|v| v.trim().to_string())
+    };
+
+    let is_rotational = read_queue_file("rotational")
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true);
+
+    let max_sectors_kb = read_queue_file("max_sectors_kb")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024);
+
+    let max_io_bytes = max_sectors_kb * 1024;
+
+    let merge_gap = if is_rotational {
+        max_io_bytes
+    } else {
+        256 * 1024
+    };
+
+    DiskProfile {
+        is_rotational,
+        max_io_bytes,
+        merge_gap,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_disk_profile(_fd: RawFd) -> DiskProfile {
+    DiskProfile::default()
+}
+
+/// Detect disk profile for a given device path.
+/// Opens the path briefly to stat it, then reads sysfs.
+/// Never fails — returns conservative defaults on any error.
+pub fn detect_disk_profile_for_path(path: &str) -> DiskProfile {
+    let c_path = match CString::new(path) {
+        Ok(p) => p,
+        Err(_) => return DiskProfile::default(),
+    };
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return DiskProfile::default();
+    }
+    let profile = detect_disk_profile(fd);
+    unsafe { libc::close(fd); }
+    profile
+}
+
 /// Default buffer size: 256 MiB (large for batch reads).
 const DEFAULT_BUF_SIZE: usize = 256 * 1024 * 1024;
 
@@ -18,6 +123,7 @@ pub struct IoEngine {
     fd: RawFd,
     buf: AlignedBuf,
     device_size: u64,
+    disk_profile: DiskProfile,
     io_log: Option<std::io::BufWriter<std::fs::File>>,
     io_log_remaining: usize,
     phase: &'static str,
@@ -34,6 +140,8 @@ impl IoEngine {
             return Err(FxfspError::Io(std::io::Error::last_os_error()));
         }
         configure_direct_io(fd)?;
+
+        let disk_profile = detect_disk_profile(fd);
 
         // Get device/file size via lseek to end.
         let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
@@ -61,6 +169,7 @@ impl IoEngine {
             fd,
             buf: alloc_aligned(DEFAULT_BUF_SIZE),
             device_size: size as u64,
+            disk_profile,
             io_log,
             io_log_remaining,
             phase: "unknown",
@@ -70,6 +179,11 @@ impl IoEngine {
     /// Device/file size in bytes.
     pub fn device_size(&self) -> u64 {
         self.device_size
+    }
+
+    /// Physical characteristics of the underlying block device.
+    pub fn disk_profile(&self) -> &DiskProfile {
+        &self.disk_profile
     }
 
     /// Set the current I/O phase label for logging.

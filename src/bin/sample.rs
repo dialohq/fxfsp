@@ -2,7 +2,7 @@ use std::env;
 use std::process;
 use std::time::Instant;
 
-use fxfsp::{FsEvent, scan};
+use fxfsp::{FsEvent, detect_disk_profile_for_path, scan};
 
 fn mode_string(mode: u16) -> String {
     let file_type = match mode & 0o170000 {
@@ -35,6 +35,9 @@ fn main() {
         process::exit(1);
     }
     let path = &args[1];
+
+    let profile = detect_disk_profile_for_path(path);
+    eprintln!("{}", profile);
 
     let start = Instant::now();
     let mut inode_count: u64 = 0;
