@@ -148,9 +148,13 @@ fn walk_inobt_node(
     } else {
         // Interior node: keys followed by pointers.
         // Keys are XfsInobtKey (4 bytes: startino) and pointers are U32 (AG block numbers).
-        // Keys are at hdr_size, pointers at hdr_size + numrecs * 4, each occupying 4 bytes.
+        // IMPORTANT: XFS lays out keys and pointers based on maxrecs (the maximum
+        // that fit in the block), NOT the current numrecs. The pointer array always
+        // starts at hdr_size + maxrecs * key_size.
         let key_size = 4usize;
-        let ptr_offset = hdr_size + numrecs as usize * key_size;
+        let ptr_size = 4usize;
+        let maxrecs = (ctx.block_size as usize - hdr_size) / (key_size + ptr_size);
+        let ptr_offset = hdr_size + maxrecs * key_size;
 
         // Collect child block numbers first (before we reuse the engine buffer).
         let mut child_blocks = Vec::with_capacity(numrecs as usize);
