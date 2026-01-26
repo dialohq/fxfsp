@@ -87,9 +87,7 @@ fn main() {
             }
         }
         FsEvent::AgBegin { ag_number } => {
-            if *ag_number % 100 == 0 {
-                println!("--- AG {} ---", ag_number);
-            }
+            println!("--- AG {} ---", ag_number);
         }
         FsEvent::AgEnd { .. } => {}
     });
