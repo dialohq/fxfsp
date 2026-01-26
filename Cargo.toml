@@ -10,5 +10,9 @@ thiserror = "2"
 crc32c = "0.6"
 libc = "0.2"
 
+[[bin]]
+name = "fxfsp-sample"
+path = "src/bin/sample.rs"
+
 [dev-dependencies]
 tempfile = "3"

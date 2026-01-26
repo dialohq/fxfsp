@@ -10,9 +10,8 @@
         pkgs = import nixpkgs { inherit system; };
       in
       {
-        devShell = with pkgs; mkShell {
-          buildInputs = [ cargo rustc rustfmt ];
-          RUST_SRC_PATH = rustPlatform.rustLibSrc;
+        devShell = pkgs.mkShell {
+          buildInputs = [ pkgs.cargo pkgs.rustc pkgs.rustfmt ];
         };
       }
     );
