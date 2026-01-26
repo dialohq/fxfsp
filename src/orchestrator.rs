@@ -14,9 +14,9 @@ use crate::xfs::inode::{
 };
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
-/// Gap-fill threshold in filesystem blocks for directory extent coalescing.
-/// With 32 GB of RAM we can afford aggressive gap-fill. 4096 blocks at 4K = 16 MiB.
-const GAP_FILL_BLOCKS: u64 = 4096;
+/// Only merge strictly adjacent extents (gap = 0). We know the exact blocks
+/// we need — reading through gaps wastes I/O on file data we don't care about.
+const GAP_FILL_BLOCKS: u64 = 0;
 
 /// Maximum gap (bytes) between inode chunks before starting a new batch read.
 const INODE_BATCH_GAP: u64 = 16 * 1024 * 1024; // 16 MiB
