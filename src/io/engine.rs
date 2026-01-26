@@ -275,10 +275,17 @@ impl IoEngine {
             return Ok(());
         }
 
-        let merge_gap = self.disk_profile.merge_gap;
-        // Cap each merged read so io_uring buffer pool stays reasonable.
-        // 16 MiB × 128 queue depth = 2 GiB worst-case pool.
-        const MAX_MERGED: usize = 16 * 1024 * 1024;
+        let merge_gap = std::env::var("FXFSP_MERGE_GAP_KB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|kb| kb * 1024)
+            .unwrap_or(self.disk_profile.merge_gap);
+
+        let max_merged = std::env::var("FXFSP_MAX_MERGED_KB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|kb| kb * 1024)
+            .unwrap_or(16 * 1024 * 1024);
 
         // ---- Build merged groups ----
         struct MergedGroup {
@@ -298,7 +305,7 @@ impl IoEngine {
                 let gap = requests[i].0.saturating_sub(g_end);
                 let new_end = requests[i].0 + requests[i].1 as u64;
                 let new_len = (new_end - g_start) as usize;
-                gap > merge_gap as u64 || new_len > MAX_MERGED
+                gap > merge_gap as u64 || new_len > max_merged
             } else {
                 true
             };
