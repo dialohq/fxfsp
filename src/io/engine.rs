@@ -45,8 +45,8 @@ fn detect_disk_profile(fd: RawFd) -> DiskProfile {
     }
 
     let rdev = stat.st_rdev;
-    let major = unsafe { libc::major(rdev) };
-    let minor = unsafe { libc::minor(rdev) };
+    let major = libc::major(rdev);
+    let minor = libc::minor(rdev);
 
     // Not a block device (regular file, etc.) — use defaults.
     if major == 0 && minor == 0 {
