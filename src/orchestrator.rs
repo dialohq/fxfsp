@@ -19,7 +19,10 @@ use crate::xfs::superblock::{FormatVersion, FsContext};
 const GAP_FILL_BLOCKS: u64 = 0;
 
 /// Maximum gap (bytes) between inode chunks before starting a new batch read.
-const INODE_BATCH_GAP: u64 = 16 * 1024 * 1024; // 16 MiB
+/// Set to 0: only merge physically adjacent chunks.  With ~100K ranges per AG
+/// the syscall overhead (~15 s) is far less than the I/O cost of reading gap
+/// data (~275 KB avg gap × 390K chunks ≈ 100+ GB of junk per AG).
+const INODE_BATCH_GAP: u64 = 0;
 
 /// Maximum batch read size for inode chunks.
 const INODE_BATCH_MAX: u64 = 256 * 1024 * 1024; // 256 MiB
