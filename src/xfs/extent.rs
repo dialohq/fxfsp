@@ -67,8 +67,14 @@ pub fn parse_extent_list(fork_buf: &[u8], nextents: u32) -> Result<Vec<Extent>, 
 }
 
 /// Convert an absolute filesystem block number to a byte offset on disk.
+///
+/// XFS fsblock numbers are packed: upper bits = AG number, lower
+/// `sb_agblklog` bits = AG-relative block.  When `sb_agblocks` is not a
+/// power of two the simple shift `fsblock << block_log` gives the wrong
+/// result for AGs beyond 0.  We must unpack first.
 pub fn fsblock_to_byte(ctx: &FsContext, fsblock: u64) -> u64 {
-    fsblock << ctx.block_log as u64
+    let (agno, agblock) = fsblock_to_ag(ctx, fsblock);
+    ctx.ag_block_to_byte(agno, agblock)
 }
 
 /// Convert an absolute filesystem block number to (agno, agblock).

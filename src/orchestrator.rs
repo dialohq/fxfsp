@@ -7,7 +7,7 @@ use crate::xfs::bmbt::collect_bmbt_extents;
 use crate::xfs::btree::collect_inobt_records;
 use crate::xfs::dir::block::parse_dir_data_block;
 use crate::xfs::dir::shortform::parse_shortform_dir;
-use crate::xfs::extent::{Extent, parse_extent_list};
+use crate::xfs::extent::{Extent, fsblock_to_byte, parse_extent_list};
 use crate::xfs::inode::{
     InodeInfo, XFS_DINODE_FMT_BTREE, XFS_DINODE_FMT_EXTENTS, XFS_DINODE_FMT_LOCAL,
     parse_inode_core,
@@ -324,18 +324,18 @@ where
     all_extents.sort_by_key(|&(_, ext)| ext.start_block);
 
     let ranges = coalesce_extents(&all_extents, ctx);
-    let device_blocks = engine.device_size() >> ctx.block_log as u64;
+    let device_size = engine.device_size();
 
     for range in &ranges {
+        let byte_offset = fsblock_to_byte(ctx, range.start_block);
         // Skip ranges that extend past the device.
-        if range.start_block >= device_blocks {
+        if byte_offset >= device_size {
             continue;
         }
-        let clamped_blocks = range.block_count.min(device_blocks - range.start_block);
-
-        let byte_offset = range.start_block << ctx.block_log as u64;
-        let byte_len = (clamped_blocks as usize) << ctx.block_log as usize;
-        let read_size = align_up(byte_len, IO_ALIGN);
+        let byte_len = (range.block_count as usize) << ctx.block_log as usize;
+        let available = (device_size - byte_offset) as usize;
+        let clamped_len = byte_len.min(available);
+        let read_size = align_up(clamped_len, IO_ALIGN);
 
         let buf = engine.read_at(byte_offset, read_size)?;
 

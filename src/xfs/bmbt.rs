@@ -6,7 +6,7 @@ use zerocopy::FromBytes;
 
 use crate::error::FxfspError;
 use crate::io::engine::IoEngine;
-use crate::xfs::extent::{Extent, XfsBmbtRec};
+use crate::xfs::extent::{Extent, XfsBmbtRec, fsblock_to_byte};
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
 /// V4 bmbt long-form block magic: "BMAP"
@@ -85,7 +85,7 @@ fn walk_bmbt_block(
     expected_level: u32,
     extents: &mut Vec<Extent>,
 ) -> Result<(), FxfspError> {
-    let byte_offset = fsblock << ctx.block_log as u64;
+    let byte_offset = fsblock_to_byte(ctx, fsblock);
     let buf = engine.read_at(byte_offset, ctx.block_size as usize)?;
 
     if buf.len() < 8 {
