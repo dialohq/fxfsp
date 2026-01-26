@@ -14,21 +14,6 @@ use crate::xfs::inode::{
 };
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
-/// Maximum gap (in filesystem blocks) between directory extents before
-/// starting a new read.  On HDD the break-even is seek_time × throughput
-/// ≈ 10 ms × 273 MB/s ≈ 2.7 MB.  At 4 K blocks that is ~680 blocks;
-/// we round to 512 (2 MiB).
-const GAP_FILL_BLOCKS: u64 = 512;
-
-/// Maximum gap (bytes) between inode chunks before starting a new batch read.
-/// Inode chunks are dense within the AG (avg gap ~275 KB).  16 MiB merges
-/// them into large sequential reads with minimal junk because the chunks
-/// are closely spaced.
-const INODE_BATCH_GAP: u64 = 16 * 1024 * 1024; // 16 MiB
-
-/// Maximum batch read size for inode chunks.
-const INODE_BATCH_MAX: u64 = 256 * 1024 * 1024; // 256 MiB
-
 /// A deferred directory work item: inode + its data extents.
 struct DirWorkItem {
     ino: u64,
@@ -42,20 +27,6 @@ struct BtreeDirItem {
     data_fork_size: usize,
 }
 
-/// A coalesced read range (in absolute filesystem blocks).
-struct ReadRange {
-    start_block: u64,
-    block_count: u64,
-    entries: Vec<DirRangeEntry>,
-}
-
-/// Tracks a directory extent within a coalesced read range.
-struct DirRangeEntry {
-    ino: u64,
-    buf_offset: usize,
-    byte_len: usize,
-}
-
 pub fn run_scan<F>(device_path: &str, mut callback: F) -> Result<(), FxfspError>
 where
     F: FnMut(&FsEvent),
@@ -63,6 +34,7 @@ where
     let mut engine = IoEngine::open(device_path)?;
 
     // Read superblock (always at byte offset 0, within first sector).
+    engine.set_phase("superblock");
     let sb_read_size = align_up(4096, IO_ALIGN);
     let sb_buf = engine.read_at(0, sb_read_size)?;
     let ctx = FsContext::from_superblock(sb_buf)?;
@@ -95,6 +67,7 @@ where
     F: FnMut(&FsEvent),
 {
     // ---- Read AGI header (at sector offset 2 within the AG) ----
+    engine.set_phase("agi");
     let agi_offset = ctx.agi_byte_offset(agno);
     let agi_block_offset = agi_offset & !(ctx.block_size as u64 - 1);
     let agi_read_size = align_up(ctx.block_size as usize, IO_ALIGN);
@@ -103,6 +76,7 @@ where
     let agi = AgiInfo::from_buf(&agi_buf[agi_within_block..], agno, ctx.version)?;
 
     // ---- Phase 1a: Collect all inobt records ----
+    engine.set_phase("inobt_walk");
     let mut inobt_records =
         collect_inobt_records(engine, ctx, agno, agi.inobt_root, agi.inobt_level)?;
 
@@ -134,56 +108,22 @@ where
     let mut dir_work: Vec<DirWorkItem> = Vec::new();
     let mut btree_dirs: Vec<BtreeDirItem> = Vec::new();
 
-    // Process chunks in batches.
-    let mut batch_start_idx = 0;
-    while batch_start_idx < chunks.len() {
-        let batch_start_byte = chunks[batch_start_idx].byte_offset;
-        let mut batch_end_byte = batch_start_byte + chunk_byte_len as u64;
-        let mut batch_end_idx = batch_start_idx + 1;
+    // Build one read request per inode chunk — the kernel I/O scheduler
+    // merges adjacent requests and reorders for optimal disk access.
+    let requests: Vec<(u64, usize, usize)> = chunks
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| (c.byte_offset, chunk_byte_len, idx))
+        .collect();
 
-        // Extend batch with nearby chunks.
-        while batch_end_idx < chunks.len() {
-            let next_start = chunks[batch_end_idx].byte_offset;
-            let gap = next_start.saturating_sub(batch_end_byte);
-            let total_span = next_start + chunk_byte_len as u64 - batch_start_byte;
-            if gap <= INODE_BATCH_GAP && total_span <= INODE_BATCH_MAX {
-                batch_end_byte = next_start + chunk_byte_len as u64;
-                batch_end_idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        // Read the entire batch range.
-        let read_len = align_up((batch_end_byte - batch_start_byte) as usize, IO_ALIGN);
-        let buf = engine.read_at(batch_start_byte, read_len)?;
-
-        // Process each chunk within this batch.
-        for chunk in &chunks[batch_start_idx..batch_end_idx] {
-            let buf_offset = (chunk.byte_offset - batch_start_byte) as usize;
-            if buf_offset + chunk_byte_len > buf.len() {
-                // Near end of device, skip partial chunk.
-                continue;
-            }
-            let chunk_buf = &buf[buf_offset..buf_offset + chunk_byte_len];
-            let rec = &inobt_records[chunk.rec_idx];
-
-            process_inode_chunk(
-                chunk_buf,
-                rec,
-                agno,
-                ctx,
-                is_v5,
-                callback,
-                &mut dir_work,
-                &mut btree_dirs,
-            )?;
-        }
-
-        batch_start_idx = batch_end_idx;
-    }
+    engine.set_phase("inode_chunks");
+    engine.read_batch(&requests, |buf, idx| {
+        let rec = &inobt_records[chunks[idx].rec_idx];
+        process_inode_chunk(buf, rec, agno, ctx, is_v5, callback, &mut dir_work, &mut btree_dirs)
+    })?;
 
     // ---- Phase 1.5: Walk bmbt trees for btree-format directories ----
+    engine.set_phase("bmbt_walk");
     for item in btree_dirs {
         let extents = collect_bmbt_extents(engine, ctx, &item.fork_data, item.data_fork_size)?;
         if !extents.is_empty() {
@@ -196,6 +136,7 @@ where
 
     // ---- Phase 2: Directory sweep ----
     if !dir_work.is_empty() {
+        engine.set_phase("dir_extents");
         phase2_dir_sweep(engine, ctx, &dir_work, callback)?;
     }
 
@@ -307,7 +248,7 @@ where
     Ok(())
 }
 
-/// Phase 2: Sort directory extents, merge/gap-fill, read sequentially, parse.
+/// Phase 2: Read directory extents via batch I/O and parse directory blocks.
 fn phase2_dir_sweep<F>(
     engine: &mut IoEngine,
     ctx: &FsContext,
@@ -317,98 +258,33 @@ fn phase2_dir_sweep<F>(
 where
     F: FnMut(&FsEvent),
 {
-    let mut all_extents: Vec<(u64, &Extent)> = Vec::new();
+    // Build one request per directory extent.
+    let mut requests: Vec<(u64, usize, u64)> = Vec::new();
     for item in dir_work {
         for ext in &item.extents {
             if ext.block_count > 0 && !ext.is_unwritten {
-                all_extents.push((item.ino, ext));
+                let byte_offset = fsblock_to_byte(ctx, ext.start_block);
+                let byte_len = (ext.block_count as usize) << ctx.block_log as usize;
+                requests.push((byte_offset, byte_len, item.ino));
             }
         }
     }
 
-    all_extents.sort_by_key(|&(_, ext)| ext.start_block);
+    // Sort by disk offset — helps the I/O scheduler.
+    requests.sort_by_key(|r| r.0);
 
-    let ranges = coalesce_extents(&all_extents, ctx);
-    let device_size = engine.device_size();
+    let dir_blk_size = ctx.dir_blk_size() as usize;
 
-    for range in &ranges {
-        let byte_offset = fsblock_to_byte(ctx, range.start_block);
-        // Skip ranges that extend past the device.
-        if byte_offset >= device_size {
-            continue;
+    engine.read_batch(&requests, |buf, ino| {
+        let mut off = 0;
+        while off + dir_blk_size <= buf.len() {
+            parse_dir_data_block(&buf[off..off + dir_blk_size], ino, ctx, callback)?;
+            off += dir_blk_size;
         }
-        let byte_len = (range.block_count as usize) << ctx.block_log as usize;
-        let available = (device_size - byte_offset) as usize;
-        let clamped_len = byte_len.min(available);
-        let read_size = align_up(clamped_len, IO_ALIGN);
-
-        let buf = engine.read_at(byte_offset, read_size)?;
-
-        for entry in &range.entries {
-            // Clamp entry to what we actually read.
-            let entry_end = entry.buf_offset + entry.byte_len;
-            if entry.buf_offset >= buf.len() {
-                continue;
-            }
-            let clamped_end = entry_end.min(buf.len());
-
-            let dir_blk_size = ctx.dir_blk_size() as usize;
-            let extent_buf = &buf[entry.buf_offset..clamped_end];
-
-            let mut off = 0;
-            while off + dir_blk_size <= extent_buf.len() {
-                let block_buf = &extent_buf[off..off + dir_blk_size];
-                parse_dir_data_block(block_buf, entry.ino, ctx, callback)?;
-                off += dir_blk_size;
-            }
-        }
-    }
+        Ok(())
+    })?;
 
     Ok(())
-}
-
-/// Coalesce sorted extents into read ranges with gap-filling.
-fn coalesce_extents(extents: &[(u64, &Extent)], ctx: &FsContext) -> Vec<ReadRange> {
-    if extents.is_empty() {
-        return Vec::new();
-    }
-
-    let mut ranges: Vec<ReadRange> = Vec::new();
-
-    for &(ino, ext) in extents {
-        let ext_start = ext.start_block;
-        let ext_blocks = ext.block_count;
-
-        if let Some(last) = ranges.last_mut() {
-            let last_end = last.start_block + last.block_count;
-            let gap = ext_start.saturating_sub(last_end);
-
-            if gap <= GAP_FILL_BLOCKS {
-                let new_end = ext_start + ext_blocks;
-                last.block_count = new_end - last.start_block;
-                let buf_offset =
-                    ((ext_start - last.start_block) as usize) << ctx.block_log as usize;
-                last.entries.push(DirRangeEntry {
-                    ino,
-                    buf_offset,
-                    byte_len: (ext_blocks as usize) << ctx.block_log as usize,
-                });
-                continue;
-            }
-        }
-
-        ranges.push(ReadRange {
-            start_block: ext_start,
-            block_count: ext_blocks,
-            entries: vec![DirRangeEntry {
-                ino,
-                buf_offset: 0,
-                byte_len: (ext_blocks as usize) << ctx.block_log as usize,
-            }],
-        });
-    }
-
-    ranges
 }
 
 fn align_up(value: usize, align: usize) -> usize {

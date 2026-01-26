@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::io::Write;
 use std::os::fd::RawFd;
 
 use crate::error::FxfspError;
@@ -8,11 +9,18 @@ use crate::io::platform::{configure_direct_io, direct_open_flags};
 /// Default buffer size: 256 MiB (large for batch reads).
 const DEFAULT_BUF_SIZE: usize = 256 * 1024 * 1024;
 
+/// Maximum number of I/O operations in flight at once for `read_batch`.
+#[cfg(target_os = "linux")]
+const BATCH_QUEUE_DEPTH: usize = 128;
+
 /// A direct-I/O engine with a single reusable aligned buffer.
 pub struct IoEngine {
     fd: RawFd,
     buf: AlignedBuf,
     device_size: u64,
+    io_log: Option<std::io::BufWriter<std::fs::File>>,
+    io_log_remaining: usize,
+    phase: &'static str,
 }
 
 impl IoEngine {
@@ -36,16 +44,48 @@ impl IoEngine {
             return Err(FxfspError::Io(std::io::Error::last_os_error()));
         }
 
+        let (io_log, io_log_remaining) = if let Ok(path) = std::env::var("FXFSP_IO_LOG") {
+            let f = std::fs::File::create(&path).map_err(FxfspError::Io)?;
+            let mut w = std::io::BufWriter::new(f);
+            writeln!(w, "phase,offset,len").map_err(FxfspError::Io)?;
+            let limit = std::env::var("FXFSP_IO_LOG_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            (Some(w), limit)
+        } else {
+            (None, 0)
+        };
+
         Ok(Self {
             fd,
             buf: alloc_aligned(DEFAULT_BUF_SIZE),
             device_size: size as u64,
+            io_log,
+            io_log_remaining,
+            phase: "unknown",
         })
     }
 
     /// Device/file size in bytes.
     pub fn device_size(&self) -> u64 {
         self.device_size
+    }
+
+    /// Set the current I/O phase label for logging.
+    pub fn set_phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
+    /// Log a single read operation to the CSV file (if enabled).
+    fn log_read(&mut self, offset: u64, len: usize) {
+        if self.io_log_remaining == 0 {
+            return;
+        }
+        if let Some(log) = &mut self.io_log {
+            let _ = writeln!(log, "{},{},{}", self.phase, offset, len);
+            self.io_log_remaining -= 1;
+        }
     }
 
     /// Read up to `len` bytes at byte offset `offset`.
@@ -64,6 +104,8 @@ impl IoEngine {
                 "read at or beyond device boundary",
             )));
         }
+
+        self.log_read(offset, clamped);
 
         // Grow buffer if needed.
         if self.buf.len() < clamped {
@@ -98,6 +140,204 @@ impl IoEngine {
 
         Ok(&self.buf[..total])
     }
+}
+
+// ---- Batch read: io_uring on Linux, pread fallback elsewhere ----
+
+#[cfg(target_os = "linux")]
+impl IoEngine {
+    /// Batch-read multiple (offset, len) pairs, calling `on_complete` for each.
+    ///
+    /// Uses io_uring to submit all reads to the kernel I/O scheduler, which
+    /// merges adjacent requests and reorders for optimal disk access.
+    ///
+    /// - `requests`: (byte_offset, byte_len, tag) triples
+    /// - `on_complete`: called once per completed read with the data buffer and tag.
+    ///   The buffer slice is only valid for the duration of the callback.
+    pub fn read_batch<T: Copy, F>(
+        &mut self,
+        requests: &[(u64, usize, T)],
+        mut on_complete: F,
+    ) -> Result<(), FxfspError>
+    where
+        F: FnMut(&[u8], T) -> Result<(), FxfspError>,
+    {
+        use io_uring::{IoUring, opcode, types};
+
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let max_len = requests.iter().map(|r| r.1).max().unwrap();
+        let aligned_max = align_up(max_len, IO_ALIGN);
+        let pool_size = BATCH_QUEUE_DEPTH.min(requests.len());
+
+        // Pre-allocate aligned buffer pool.  Declared before `ring` so that
+        // on drop, the ring is destroyed first (cancelling in-flight ops)
+        // before the buffers are freed.
+        let mut pool: Vec<AlignedBuf> = (0..pool_size)
+            .map(|_| alloc_aligned(aligned_max))
+            .collect();
+
+        // Grab stable raw pointers — the Vec is never resized, so these
+        // remain valid for the lifetime of this function.
+        let pool_ptrs: Vec<*mut u8> = pool.iter_mut().map(|b| b.as_mut_ptr()).collect();
+
+        let mut slot_tags: Vec<Option<T>> = vec![None; pool_size];
+        let mut slot_lens: Vec<usize> = vec![0; pool_size];
+        let mut free_slots: Vec<usize> = (0..pool_size).rev().collect();
+
+        let mut ring: IoUring =
+            IoUring::new(BATCH_QUEUE_DEPTH as u32).map_err(FxfspError::Io)?;
+
+        let mut next_req = 0usize;
+        let mut in_flight = 0usize;
+
+        while next_req < requests.len() || in_flight > 0 {
+            // ---- Submit phase: fill the SQ with new requests ----
+            {
+                let mut sq = ring.submission();
+                while next_req < requests.len() && !free_slots.is_empty() {
+                    let (offset, len, tag) = requests[next_req];
+                    next_req += 1;
+
+                    let available = self.device_size.saturating_sub(offset) as usize;
+                    let clamped = len.min(available) & !(IO_ALIGN - 1);
+                    if clamped == 0 {
+                        continue;
+                    }
+
+                    self.log_read(offset, clamped);
+
+                    let slot = free_slots.pop().unwrap();
+                    slot_tags[slot] = Some(tag);
+                    slot_lens[slot] = clamped;
+
+                    let sqe = opcode::Read::new(
+                        types::Fd(self.fd),
+                        pool_ptrs[slot],
+                        clamped as u32,
+                    )
+                    .offset(offset)
+                    .build()
+                    .user_data(slot as u64);
+
+                    unsafe {
+                        sq.push(&sqe).map_err(|_| {
+                            FxfspError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "io_uring submission queue full",
+                            ))
+                        })?;
+                    }
+                    in_flight += 1;
+                }
+            } // sq dropped — releases &mut ring
+
+            if in_flight == 0 {
+                break;
+            }
+
+            // Submit all queued SQEs and wait for at least 1 completion.
+            loop {
+                match ring.submit_and_wait(1) {
+                    Ok(_) => break,
+                    Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                    Err(e) => return Err(FxfspError::Io(e)),
+                }
+            }
+
+            // ---- Completion phase: drain all available CQEs ----
+            {
+                let cq = ring.completion();
+                for cqe in cq {
+                    let slot = cqe.user_data() as usize;
+                    let result = cqe.result();
+
+                    if result < 0 {
+                        return Err(FxfspError::Io(std::io::Error::from_raw_os_error(
+                            -result,
+                        )));
+                    }
+
+                    let tag = slot_tags[slot].take().unwrap();
+                    let bytes_read = (result as usize).min(slot_lens[slot]);
+
+                    let buf_slice =
+                        unsafe { std::slice::from_raw_parts(pool_ptrs[slot], bytes_read) };
+                    on_complete(buf_slice, tag)?;
+
+                    free_slots.push(slot);
+                    in_flight -= 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl IoEngine {
+    /// Batch-read multiple (offset, len) pairs, calling `on_complete` for each.
+    ///
+    /// Fallback implementation using sequential pread() calls.  Same API as
+    /// the Linux io_uring version so all callers are platform-agnostic.
+    pub fn read_batch<T: Copy, F>(
+        &mut self,
+        requests: &[(u64, usize, T)],
+        mut on_complete: F,
+    ) -> Result<(), FxfspError>
+    where
+        F: FnMut(&[u8], T) -> Result<(), FxfspError>,
+    {
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let max_len = requests.iter().map(|r| r.1).max().unwrap();
+        let aligned_max = align_up(max_len, IO_ALIGN);
+        let mut buf = alloc_aligned(aligned_max);
+
+        for &(offset, len, tag) in requests {
+            let available = self.device_size.saturating_sub(offset) as usize;
+            let clamped = len.min(available) & !(IO_ALIGN - 1);
+            if clamped == 0 {
+                continue;
+            }
+
+            self.log_read(offset, clamped);
+
+            let mut total = 0usize;
+            while total < clamped {
+                let ret = unsafe {
+                    libc::pread(
+                        self.fd,
+                        buf[total..].as_mut_ptr() as *mut libc::c_void,
+                        clamped - total,
+                        (offset + total as u64) as libc::off_t,
+                    )
+                };
+                if ret < 0 {
+                    return Err(FxfspError::Io(std::io::Error::last_os_error()));
+                }
+                if ret == 0 {
+                    break;
+                }
+                total += ret as usize;
+            }
+
+            if total > 0 {
+                on_complete(&buf[..total], tag)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
 }
 
 impl Drop for IoEngine {
