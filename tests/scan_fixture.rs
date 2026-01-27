@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::Path;
 
-use fxfsp::{FsEvent, scan};
+use fxfsp::{FsEvent, IoEngine, MaybeInstrumented, scan_reader};
 
 const FIXTURE_PATH: &str = "tests/fixtures/test_v5.xfs";
 
@@ -47,7 +47,9 @@ impl ScanResult {
             dir_entries: Vec::new(),
         };
 
-        scan(FIXTURE_PATH, |event| {
+        let engine = IoEngine::open(FIXTURE_PATH, 256 * 1024, 2 * 1024 * 1024).expect("failed to open fixture");
+        let mut reader = MaybeInstrumented::from_env(engine).expect("failed to create reader");
+        scan_reader(&mut reader, |event| {
             match event {
                 FsEvent::Superblock {
                     block_size,

@@ -9,7 +9,6 @@ use crate::io::platform::{configure_direct_io, direct_open_flags};
 pub struct DiskProfile {
     pub is_rotational: bool,
     pub max_io_bytes: usize,
-    pub merge_gap: usize,
 }
 
 impl Default for DiskProfile {
@@ -17,7 +16,6 @@ impl Default for DiskProfile {
         Self {
             is_rotational: true,
             max_io_bytes: 1024 * 1024,
-            merge_gap: 1024 * 1024,
         }
     }
 }
@@ -26,8 +24,8 @@ impl std::fmt::Display for DiskProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Disk: rotational={} max_io={} merge_gap={}",
-            self.is_rotational, self.max_io_bytes, self.merge_gap
+            "Disk: rotational={} max_io={}",
+            self.is_rotational, self.max_io_bytes
         )
     }
 }
@@ -75,16 +73,9 @@ fn detect_disk_profile(fd: RawFd) -> DiskProfile {
 
     let max_io_bytes = max_sectors_kb * 1024;
 
-    let merge_gap = if is_rotational {
-        max_io_bytes
-    } else {
-        256 * 1024
-    };
-
     DiskProfile {
         is_rotational,
         max_io_bytes,
-        merge_gap,
     }
 }
 
@@ -122,12 +113,16 @@ pub struct IoEngine {
     fd: RawFd,
     buf: AlignedBuf,
     device_size: u64,
-    disk_profile: DiskProfile,
+    merge_gap: usize,
+    max_merged: usize,
 }
 
 impl IoEngine {
     /// Open `path` with direct I/O.
-    pub fn open(path: &str) -> Result<Self, FxfspError> {
+    ///
+    /// `merge_gap`: maximum gap (bytes) between two reads to coalesce them.
+    /// `max_merged`: maximum size (bytes) of a single coalesced read.
+    pub fn open(path: &str, merge_gap: usize, max_merged: usize) -> Result<Self, FxfspError> {
         let c_path =
             CString::new(path).map_err(|_| FxfspError::Parse("invalid path (contains NUL)"))?;
         let flags = direct_open_flags();
@@ -136,8 +131,6 @@ impl IoEngine {
             return Err(FxfspError::Io(std::io::Error::last_os_error()));
         }
         configure_direct_io(fd)?;
-
-        let disk_profile = detect_disk_profile(fd);
 
         // Get device/file size via lseek to end.
         let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
@@ -152,18 +145,14 @@ impl IoEngine {
             fd,
             buf: alloc_aligned(DEFAULT_BUF_SIZE),
             device_size: size as u64,
-            disk_profile,
+            merge_gap,
+            max_merged,
         })
     }
 
     /// Device/file size in bytes.
     pub fn device_size(&self) -> u64 {
         self.device_size
-    }
-
-    /// Physical characteristics of the underlying block device.
-    pub fn disk_profile(&self) -> &DiskProfile {
-        &self.disk_profile
     }
 
     /// Read up to `len` bytes at byte offset `offset`.
@@ -218,11 +207,8 @@ impl IoEngine {
     }
 
     /// Read with coalescing: merge sorted requests whose gaps fall within
-    /// `disk_profile.merge_gap` into larger sequential reads, then submit
-    /// the merged reads through `read_batch` (io_uring on Linux).
-    ///
-    /// Each merged read is capped at `max_merged_bytes` so the io_uring
-    /// buffer pool stays bounded.
+    /// `merge_gap` into larger sequential reads, then submit the merged
+    /// reads through `read_batch` (io_uring on Linux).
     ///
     /// `requests` **must** be sorted by offset (ascending).
     pub fn coalesced_read_batch<T: Copy, F>(
@@ -237,17 +223,8 @@ impl IoEngine {
             return Ok(());
         }
 
-        let merge_gap = std::env::var("FXFSP_MERGE_GAP_KB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|kb| kb * 1024)
-            .unwrap_or(self.disk_profile.merge_gap);
-
-        let max_merged = std::env::var("FXFSP_MAX_MERGED_KB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|kb| kb * 1024)
-            .unwrap_or(16 * 1024 * 1024);
+        let merge_gap = self.merge_gap;
+        let max_merged = self.max_merged;
 
         // ---- Build merged groups ----
         struct MergedGroup {

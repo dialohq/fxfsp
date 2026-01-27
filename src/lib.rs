@@ -11,7 +11,9 @@ pub use error::FxfspError;
 pub use reader::{IoPhase, IoReader};
 
 #[cfg(feature = "io")]
-pub use io::engine::{DiskProfile, detect_disk_profile_for_path};
+pub use io::engine::{DiskProfile, IoEngine, detect_disk_profile_for_path};
+#[cfg(feature = "io")]
+pub use io::reader::MaybeInstrumented;
 
 /// Events emitted during a filesystem scan.
 ///
@@ -70,19 +72,3 @@ where
     }
 }
 
-/// Scan an XFS filesystem at the given device/image path.
-///
-/// Convenience wrapper that opens the device with the built-in [`io::engine::IoEngine`]
-/// and optional CSV instrumentation (via `FXFSP_IO_LOG` / `FXFSP_IO_LOG_LIMIT`
-/// environment variables).
-///
-/// See [`scan_reader`] for the generic version.
-#[cfg(feature = "io")]
-pub fn scan<F>(device_path: &str, callback: F) -> Result<(), FxfspError>
-where
-    F: FnMut(&FsEvent) -> ControlFlow<()>,
-{
-    let engine = io::engine::IoEngine::open(device_path)?;
-    let mut reader = io::reader::MaybeInstrumented::from_env(engine)?;
-    scan_reader(&mut reader, callback)
-}

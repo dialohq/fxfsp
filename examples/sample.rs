@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use std::process;
 use std::time::Instant;
 
-use fxfsp::{FsEvent, detect_disk_profile_for_path, scan};
+use fxfsp::{FsEvent, IoEngine, MaybeInstrumented, detect_disk_profile_for_path, scan_reader};
 
 fn mode_string(mode: u16) -> String {
     let file_type = match mode & 0o170000 {
@@ -29,20 +29,77 @@ fn mode_string(mode: u16) -> String {
     )
 }
 
-fn main() {
+struct Args {
+    path: String,
+    max_ag: Option<u32>,
+    merge_gap_kb: usize,
+    max_merged_kb: usize,
+}
+
+fn parse_args() -> Args {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: fxfsp-sample <device-or-image>");
-        process::exit(1);
+    let mut path = None;
+    let mut max_ag = None;
+    let mut merge_gap_kb = 256;
+    let mut max_merged_kb = 2048;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max-ag" => {
+                i += 1;
+                max_ag = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--merge-gap" => {
+                i += 1;
+                merge_gap_kb = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(merge_gap_kb);
+            }
+            "--max-merged" => {
+                i += 1;
+                max_merged_kb = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(max_merged_kb);
+            }
+            _ if !args[i].starts_with('-') && path.is_none() => {
+                path = Some(args[i].clone());
+            }
+            _ => {
+                eprintln!("Unknown argument: {}", args[i]);
+                eprintln!("Usage: sample [--max-ag N] [--merge-gap KB] [--max-merged KB] <device-or-image>");
+                process::exit(1);
+            }
+        }
+        i += 1;
     }
-    let path = &args[1];
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("Usage: sample [--max-ag N] [--merge-gap KB] [--max-merged KB] <device-or-image>");
+            process::exit(1);
+        }
+    };
+    Args { path, max_ag, merge_gap_kb, max_merged_kb }
+}
 
-    let max_ag: Option<u32> = env::var("FXFSP_MAX_AG")
-        .ok()
-        .and_then(|s| s.parse().ok());
+fn main() {
+    let args = parse_args();
 
-    let profile = detect_disk_profile_for_path(path);
+    let profile = detect_disk_profile_for_path(&args.path);
     eprintln!("{}", profile);
+    eprintln!("merge_gap={} KB  max_merged={} KB", args.merge_gap_kb, args.max_merged_kb);
+
+    let engine = IoEngine::open(
+        &args.path,
+        args.merge_gap_kb * 1024,
+        args.max_merged_kb * 1024,
+    ).unwrap_or_else(|e| {
+        eprintln!("Failed to open {}: {e}", args.path);
+        process::exit(1);
+    });
+
+    let mut reader = MaybeInstrumented::from_env(engine).unwrap_or_else(|e| {
+        eprintln!("Failed to set up I/O reader: {e}", );
+        process::exit(1);
+    });
+
+    let max_ag = args.max_ag;
 
     let start = Instant::now();
     let mut inode_count: u64 = 0;
@@ -50,7 +107,7 @@ fn main() {
     let mut dir_count: u64 = 0;
     let mut file_count: u64 = 0;
 
-    let result = scan(path, |event| {
+    let result = scan_reader(&mut reader, |event| {
         match event {
             FsEvent::Superblock { block_size, ag_count, inode_size, root_ino } => {
                 println!(
