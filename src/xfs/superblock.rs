@@ -183,16 +183,4 @@ impl FsContext {
     pub fn dir_blk_size(&self) -> u32 {
         self.block_size * self.dir_blk_fsblocks()
     }
-
-    /// Given an absolute inode number, return the byte offset of the block
-    /// containing it and the byte offset of the inode within that block.
-    pub fn ino_to_disk_position(&self, ino: u64) -> (u64, usize) {
-        let agno = self.ino_to_agno(ino);
-        let agino = self.ino_to_agino(ino);
-        let ag_block = agino >> self.inop_blog;
-        let block_byte = self.ag_block_to_byte(agno, ag_block);
-        let within = (agino & ((1u32 << self.inop_blog) - 1)) as usize
-            * self.inode_size as usize;
-        (block_byte, within)
-    }
 }

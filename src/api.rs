@@ -1,6 +1,5 @@
 use crate::error::FxfspError;
 use crate::orchestrator;
-use crate::tree_scan;
 
 /// Events emitted during a filesystem scan.
 ///
@@ -58,18 +57,4 @@ where
     F: FnMut(&FsEvent),
 {
     orchestrator::run_scan(device_path, callback)
-}
-
-/// Scan an XFS filesystem by walking the directory tree from root.
-///
-/// Only reads directory inodes and directory data blocks — file inodes
-/// are never touched. Much faster than `scan()` when you only need
-/// the directory structure.
-///
-/// Emits: `Superblock`, `InodeFound` (directories only), `DirEntry`.
-pub fn scan_tree<F>(device_path: &str, callback: F) -> Result<(), FxfspError>
-where
-    F: FnMut(&FsEvent),
-{
-    tree_scan::run_tree_scan(device_path, callback)
 }
