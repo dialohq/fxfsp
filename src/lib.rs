@@ -9,6 +9,7 @@ pub mod xfs;
 
 pub use error::FxfspError;
 pub use reader::{IoPhase, IoReader};
+pub use xfs::extent::Extent;
 
 #[cfg(feature = "io")]
 pub use io::engine::{DiskProfile, IoEngine, detect_disk_profile_for_path};
@@ -27,6 +28,10 @@ pub enum FsEvent<'a> {
         root_ino: u64,
     },
     /// An allocated inode was found.
+    ///
+    /// For regular files with inline extent lists (`FMT_EXTENTS`), `extents`
+    /// contains the file's physical extent map at zero extra I/O cost.
+    /// For btree-format files, extents arrive later via [`FileExtents`].
     InodeFound {
         ag_number: u32,
         ino: u64,
@@ -42,6 +47,18 @@ pub enum FsEvent<'a> {
         ctime_sec: u32,
         ctime_nsec: u32,
         nblocks: u64,
+        /// Physical extent map for regular files with inline extents.
+        /// `None` for directories, non-regular files, and btree-format files
+        /// (whose extents arrive via [`FileExtents`]).
+        extents: Option<Vec<Extent>>,
+    },
+    /// Physical extent map for a btree-format regular file.
+    ///
+    /// Emitted after the batched bmbt walk (phase 1.5), separately from
+    /// [`InodeFound`] to avoid random disk seeks during the inode scan.
+    FileExtents {
+        ino: u64,
+        extents: Vec<Extent>,
     },
     /// A directory entry.
     DirEntry {

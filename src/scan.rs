@@ -39,8 +39,8 @@ struct DirWorkItem {
     extents: Vec<Extent>,
 }
 
-/// Deferred btree-format directory: we need the engine to walk the bmbt.
-struct BtreeDirItem {
+/// Deferred btree-format inode: we need the engine to walk the bmbt.
+struct BtreeItem {
     ino: u64,
     fork_data: Vec<u8>,
     data_fork_size: usize,
@@ -118,7 +118,8 @@ where
         .collect();
 
     let mut dir_work: Vec<DirWorkItem> = Vec::new();
-    let mut btree_dirs: Vec<BtreeDirItem> = Vec::new();
+    let mut btree_dirs: Vec<BtreeItem> = Vec::new();
+    let mut btree_files: Vec<BtreeItem> = Vec::new();
 
     // Build one read request per inode chunk — the kernel I/O scheduler
     // merges adjacent requests and reorders for optimal disk access.
@@ -130,13 +131,15 @@ where
 
     engine.coalesced_read_batch(&requests, |buf, idx| {
         let rec = &inobt_records[chunks[idx].rec_idx];
-        process_inode_chunk(buf, rec, agno, ctx, is_v5, callback, &mut dir_work, &mut btree_dirs)
+        process_inode_chunk(buf, rec, agno, ctx, is_v5, callback, &mut dir_work, &mut btree_dirs, &mut btree_files)
     }, IoPhase::InodeChunks)?;
 
-    // ---- Phase 1.5: Walk bmbt trees for btree-format directories (batched) ----
-    if !btree_dirs.is_empty() {
+    // ---- Phase 1.5: Walk bmbt trees for btree-format inodes (batched) ----
+    // Batch directories and regular files together for one sorted sweep.
+    if !btree_dirs.is_empty() || !btree_files.is_empty() {
         let inputs: Vec<BmbtDirInput> = btree_dirs
             .iter()
+            .chain(btree_files.iter())
             .map(|item| BmbtDirInput {
                 ino: item.ino,
                 fork_data: &item.fork_data,
@@ -144,11 +147,22 @@ where
             })
             .collect();
         let bmbt_results = collect_all_bmbt_extents(engine, ctx, &inputs)?;
+
+        // Separate dir vs file results by checking which inos came from btree_dirs.
+        let dir_inos: std::collections::HashSet<u64> =
+            btree_dirs.iter().map(|d| d.ino).collect();
+
         for (ino, extents) in bmbt_results {
-            if !extents.is_empty() {
+            if extents.is_empty() {
+                continue;
+            }
+            if dir_inos.contains(&ino) {
                 dir_work.push(DirWorkItem { ino, extents });
+            } else {
+                emit(callback, &FsEvent::FileExtents { ino, extents })?;
             }
         }
+
     }
 
     // ---- Phase 2: Directory sweep ----
@@ -168,7 +182,8 @@ fn process_inode_chunk<F>(
     is_v5: bool,
     callback: &mut F,
     dir_work: &mut Vec<DirWorkItem>,
-    btree_dirs: &mut Vec<BtreeDirItem>,
+    btree_dirs: &mut Vec<BtreeItem>,
+    btree_files: &mut Vec<BtreeItem>,
 ) -> Result<(), FxfspError>
 where
     F: FnMut(&FsEvent) -> ControlFlow<()>,
@@ -194,6 +209,14 @@ where
         let inode_buf = &chunk_buf[inode_offset..];
         let info = parse_inode_core(inode_buf, abs_ino, is_v5, ctx.has_nrext64, ctx.inode_size)?;
 
+        // Extract inline extents for regular files (zero extra I/O).
+        let extents = if info.is_regular() && info.format == XFS_DINODE_FMT_EXTENTS && info.nextents > 0 {
+            let fork_buf = &inode_buf[info.data_fork_offset..];
+            Some(parse_extent_list(fork_buf, info.nextents)?)
+        } else {
+            None
+        };
+
         emit(callback, &FsEvent::InodeFound {
             ag_number: agno,
             ino: info.ino,
@@ -209,10 +232,21 @@ where
             ctime_sec: info.ctime_sec,
             ctime_nsec: info.ctime_nsec,
             nblocks: info.nblocks,
+            extents,
         })?;
 
         if info.is_dir() {
             handle_directory(inode_buf, &info, ctx, callback, dir_work, btree_dirs)?;
+        } else if info.is_regular() && info.format == XFS_DINODE_FMT_BTREE {
+            // Defer btree-format files to phase 1.5 batch walk.
+            let fork_start = info.data_fork_offset;
+            let fork_end = (fork_start + info.data_fork_size).min(inode_buf.len());
+            let fork_data = inode_buf[fork_start..fork_end].to_vec();
+            btree_files.push(BtreeItem {
+                ino: info.ino,
+                fork_data,
+                data_fork_size: info.data_fork_size,
+            });
         }
     }
 
@@ -226,7 +260,7 @@ fn handle_directory<F>(
     ctx: &FsContext,
     callback: &mut F,
     dir_work: &mut Vec<DirWorkItem>,
-    btree_dirs: &mut Vec<BtreeDirItem>,
+    btree_dirs: &mut Vec<BtreeItem>,
 ) -> Result<(), FxfspError>
 where
     F: FnMut(&FsEvent) -> ControlFlow<()>,
@@ -254,7 +288,7 @@ where
             let fork_start = info.data_fork_offset;
             let fork_end = (fork_start + info.data_fork_size).min(inode_buf.len());
             let fork_data = inode_buf[fork_start..fork_end].to_vec();
-            btree_dirs.push(BtreeDirItem {
+            btree_dirs.push(BtreeItem {
                 ino: info.ino,
                 fork_data,
                 data_fork_size: info.data_fork_size,

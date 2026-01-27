@@ -132,6 +132,9 @@ fn main() {
                     );
                 }
             }
+            FsEvent::FileExtents { .. } => {
+                // File extent maps available for later batch reads.
+            }
             FsEvent::DirEntry { parent_ino, child_ino, name, file_type } => {
                 dir_entry_count += 1;
                 if dir_entry_count % 1000 == 0 {

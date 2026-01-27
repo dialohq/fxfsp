@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::ops::ControlFlow;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use fxfsp::{FsEvent, IoEngine, MaybeInstrumented, scan_reader};
+use fxfsp::{Extent, FsEvent, IoEngine, MaybeInstrumented, scan_reader};
+use fxfsp::xfs::extent::fsblock_to_byte;
+use fxfsp::xfs::superblock::FsContext;
 
 const FIXTURE_PATH: &str = "tests/fixtures/test_v5.xfs";
 
@@ -16,6 +20,8 @@ struct ScanResult {
     inodes: HashMap<u64, InodeRecord>,
     /// (parent_ino, name) -> (child_ino, file_type)
     dir_entries: Vec<DirEntryRecord>,
+    /// ino -> extents (from InodeFound inline + FileExtents events)
+    file_extents: HashMap<u64, Vec<Extent>>,
 }
 
 #[allow(dead_code)]
@@ -45,6 +51,7 @@ impl ScanResult {
             root_ino: 0,
             inodes: HashMap::new(),
             dir_entries: Vec::new(),
+            file_extents: HashMap::new(),
         };
 
         let engine = IoEngine::open(FIXTURE_PATH, 256 * 1024, 2 * 1024 * 1024).expect("failed to open fixture");
@@ -70,6 +77,7 @@ impl ScanResult {
                     uid,
                     gid,
                     nblocks,
+                    extents,
                     ..
                 } => {
                     result.inodes.insert(
@@ -83,6 +91,12 @@ impl ScanResult {
                             nblocks: *nblocks,
                         },
                     );
+                    if let Some(exts) = extents {
+                        result.file_extents.insert(*ino, exts.clone());
+                    }
+                }
+                FsEvent::FileExtents { ino, extents } => {
+                    result.file_extents.insert(*ino, extents.clone());
                 }
                 FsEvent::DirEntry {
                     parent_ino,
@@ -350,6 +364,138 @@ fn all_numbered_files_are_empty_regular_files() {
         assert_eq!(inode.size, 0, "{name} should be an empty file (size=0)");
         assert_eq!(inode.mode & 0o170000, 0o100000, "{name} should be a regular file");
     }
+}
+
+// ---------------------------------------------------------------------------
+// File extents
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hello_txt_has_extents() {
+    if skip_if_missing() { return; }
+    let r = ScanResult::collect();
+
+    let entry = r.find_entry(r.root_ino, "hello.txt").unwrap();
+    let extents = r.file_extents.get(&entry.child_ino)
+        .expect("hello.txt should have extents");
+
+    assert!(!extents.is_empty(), "hello.txt should have at least one extent");
+    assert_eq!(extents[0].logical_offset, 0, "first extent should start at logical offset 0");
+    assert!(extents[0].block_count > 0, "extent should have nonzero block count");
+    assert!(!extents[0].is_unwritten, "hello.txt extent should not be unwritten");
+}
+
+#[test]
+fn empty_file_has_no_extents() {
+    if skip_if_missing() { return; }
+    let r = ScanResult::collect();
+
+    let entry = r.find_entry(r.root_ino, "empty_file").unwrap();
+    // Empty files have no data blocks, so no extents should be emitted.
+    assert!(
+        !r.file_extents.contains_key(&entry.child_ino),
+        "empty_file should have no extents"
+    );
+}
+
+#[test]
+fn non_empty_regular_files_have_extents() {
+    if skip_if_missing() { return; }
+    let r = ScanResult::collect();
+
+    // Every regular file with size > 0 should have extents.
+    for (&ino, rec) in &r.inodes {
+        if (rec.mode & 0o170000) == 0o100000 && rec.size > 0 {
+            assert!(
+                r.file_extents.contains_key(&ino),
+                "regular file ino={} size={} should have extents",
+                ino, rec.size
+            );
+        }
+    }
+}
+
+#[test]
+fn directories_have_no_file_extents() {
+    if skip_if_missing() { return; }
+    let r = ScanResult::collect();
+
+    // Directory extents are handled internally; they should NOT appear in file_extents.
+    for (&ino, rec) in &r.inodes {
+        if (rec.mode & 0o170000) == 0o040000 {
+            assert!(
+                !r.file_extents.contains_key(&ino),
+                "directory ino={} should not have file extents",
+                ino
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extent-based file content verification
+// ---------------------------------------------------------------------------
+
+/// Read file content from the raw fixture image using extent information.
+///
+/// Opens the fixture file, parses the superblock to get an FsContext,
+/// then reads data at the byte offsets computed from the extent records.
+fn read_file_from_extents(extents: &[Extent], file_size: u64) -> Vec<u8> {
+    let f = File::open(FIXTURE_PATH).expect("failed to open fixture for extent read");
+
+    // Parse the superblock to get FsContext (needed for fsblock → byte conversion).
+    let mut sb_buf = vec![0u8; 4096];
+    f.read_at(&mut sb_buf, 0).expect("failed to read superblock");
+    let ctx = FsContext::from_superblock(&sb_buf).expect("failed to parse superblock");
+
+    let block_size = ctx.block_size as u64;
+    let mut data = Vec::new();
+    let mut remaining = file_size;
+
+    for ext in extents {
+        if remaining == 0 {
+            break;
+        }
+        let byte_offset = fsblock_to_byte(&ctx, ext.start_block);
+        let extent_bytes = ext.block_count * block_size;
+        let to_read = remaining.min(extent_bytes) as usize;
+
+        let mut buf = vec![0u8; to_read];
+        f.read_at(&mut buf, byte_offset).expect("failed to read extent data");
+        data.extend_from_slice(&buf);
+        remaining = remaining.saturating_sub(extent_bytes);
+    }
+
+    data
+}
+
+#[test]
+fn hello_txt_content_matches_via_extents() {
+    if skip_if_missing() { return; }
+    let r = ScanResult::collect();
+
+    let entry = r.find_entry(r.root_ino, "hello.txt").unwrap();
+    let inode = r.inodes.get(&entry.child_ino).expect("hello.txt inode not found");
+    let extents = r.file_extents.get(&entry.child_ino)
+        .expect("hello.txt should have extents");
+
+    let content = read_file_from_extents(extents, inode.size);
+    assert_eq!(content, b"hello\n", "hello.txt content should be \"hello\\n\"");
+}
+
+#[test]
+fn nested_txt_content_matches_via_extents() {
+    if skip_if_missing() { return; }
+    let r = ScanResult::collect();
+
+    let subdir_entry = r.find_entry(r.root_ino, "subdir").unwrap();
+    let nested_entry = r.find_entry(subdir_entry.child_ino, "nested.txt").unwrap();
+    let inode = r.inodes.get(&nested_entry.child_ino).expect("nested.txt inode not found");
+    let extents = r.file_extents.get(&nested_entry.child_ino)
+        .expect("nested.txt should have extents");
+
+    let content = read_file_from_extents(extents, inode.size);
+    assert_eq!(content, b"nested\n", "nested.txt content should be \"nested\\n\"");
 }
 
 // ---------------------------------------------------------------------------
