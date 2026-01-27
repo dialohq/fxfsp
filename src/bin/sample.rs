@@ -2,7 +2,7 @@ use std::env;
 use std::process;
 use std::time::Instant;
 
-use fxfsp::{FsEvent, detect_disk_profile_for_path, scan};
+use fxfsp::{FsEvent, detect_disk_profile_for_path, scan, scan_tree};
 
 fn mode_string(mode: u16) -> String {
     let file_type = match mode & 0o170000 {
@@ -22,22 +22,36 @@ fn mode_string(mode: u16) -> String {
     format!(
         "{}{}{}{}{}{}{}{}{}{}",
         file_type,
-        r(0o400), w(0o200), x(0o100),
-        r(0o040), w(0o020), x(0o010),
-        r(0o004), w(0o002), x(0o001),
+        r(0o400),
+        w(0o200),
+        x(0o100),
+        r(0o040),
+        w(0o020),
+        x(0o010),
+        r(0o004),
+        w(0o002),
+        x(0o001),
     )
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: fxfsp-sample <device-or-image>");
-        process::exit(1);
-    }
-    let path = &args[1];
+
+    let (tree_mode, path) = match args.len() {
+        2 => (false, &args[1]),
+        3 if args[1] == "--tree" => (true, &args[2]),
+        _ => {
+            eprintln!("Usage: fxfsp-sample [--tree] <device-or-image>");
+            process::exit(1);
+        }
+    };
 
     let profile = detect_disk_profile_for_path(path);
     eprintln!("{}", profile);
+
+    if tree_mode {
+        eprintln!("Mode: tree scan (directory walk)");
+    }
 
     let start = Instant::now();
     let mut inode_count: u64 = 0;
@@ -45,14 +59,29 @@ fn main() {
     let mut dir_count: u64 = 0;
     let mut file_count: u64 = 0;
 
-    let result = scan(path, |event| match event {
-        FsEvent::Superblock { block_size, ag_count, inode_size, root_ino } => {
+    let mut handle_event = |event: &FsEvent| match event {
+        FsEvent::Superblock {
+            block_size,
+            ag_count,
+            inode_size,
+            root_ino,
+        } => {
             println!(
                 "Superblock: block_size={} ag_count={} inode_size={} root_ino={}",
                 block_size, ag_count, inode_size, root_ino
             );
         }
-        FsEvent::InodeFound { ino, mode, size, uid, gid, nlink, mtime_sec, nblocks, .. } => {
+        FsEvent::InodeFound {
+            ino,
+            mode,
+            size,
+            uid,
+            gid,
+            nlink,
+            mtime_sec,
+            nblocks,
+            ..
+        } => {
             inode_count += 1;
             match mode & 0o170000 {
                 0o040000 => dir_count += 1,
@@ -62,11 +91,24 @@ fn main() {
             if inode_count % 1000 == 0 {
                 println!(
                     "[inode #{:>9}] ino={:<12} {} uid={:<5} gid={:<5} nlink={:<4} size={:<12} blocks={:<8} mtime={}",
-                    inode_count, ino, mode_string(*mode), uid, gid, nlink, size, nblocks, mtime_sec
+                    inode_count,
+                    ino,
+                    mode_string(*mode),
+                    uid,
+                    gid,
+                    nlink,
+                    size,
+                    nblocks,
+                    mtime_sec
                 );
             }
         }
-        FsEvent::DirEntry { parent_ino, child_ino, name, file_type } => {
+        FsEvent::DirEntry {
+            parent_ino,
+            child_ino,
+            name,
+            file_type,
+        } => {
             dir_entry_count += 1;
             if dir_entry_count % 1000 == 0 {
                 let name_str = String::from_utf8_lossy(name);
@@ -90,7 +132,13 @@ fn main() {
             println!("--- AG {} ---", ag_number);
         }
         FsEvent::AgEnd { .. } => {}
-    });
+    };
+
+    let result = if tree_mode {
+        scan_tree(path, &mut handle_event)
+    } else {
+        scan(path, &mut handle_event)
+    };
 
     let elapsed = start.elapsed();
 
