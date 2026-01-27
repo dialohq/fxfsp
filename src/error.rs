@@ -10,4 +10,7 @@ pub enum FxfspError {
     Parse(&'static str),
     #[error("CRC mismatch in {0}")]
     CrcMismatch(&'static str),
+    /// Scan was stopped early by the callback (not a real error).
+    #[error("scan stopped by callback")]
+    Stopped,
 }

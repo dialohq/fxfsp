@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use crate::api::FsEvent;
 use crate::error::FxfspError;
 use crate::io::aligned_buf::IO_ALIGN;
@@ -14,6 +16,21 @@ use crate::xfs::inode::{
 };
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
+/// XFS superblock is always at byte offset 0 and fits within this many bytes.
+/// We read this much before the filesystem block size is known.
+const SUPERBLOCK_SIZE: usize = 4096;
+
+/// Call the callback, converting `ControlFlow::Break` into `FxfspError::Stopped`.
+fn emit<F>(callback: &mut F, event: &FsEvent) -> Result<(), FxfspError>
+where
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
+{
+    match callback(event) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(()) => Err(FxfspError::Stopped),
+    }
+}
+
 /// A deferred directory work item: inode + its data extents.
 struct DirWorkItem {
     ino: u64,
@@ -29,34 +46,37 @@ struct BtreeDirItem {
 
 pub fn run_scan<F>(device_path: &str, mut callback: F) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
+{
+    let result = run_scan_inner(device_path, &mut callback);
+    match result {
+        Err(FxfspError::Stopped) => Ok(()),
+        other => other,
+    }
+}
+
+fn run_scan_inner<F>(device_path: &str, callback: &mut F) -> Result<(), FxfspError>
+where
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     let mut engine = IoEngine::open(device_path)?;
 
     // Read superblock (always at byte offset 0, within first sector).
     engine.set_phase("superblock");
-    let sb_read_size = align_up(4096, IO_ALIGN);
+    let sb_read_size = align_up(SUPERBLOCK_SIZE, IO_ALIGN);
     let sb_buf = engine.read_at(0, sb_read_size)?;
     let ctx = FsContext::from_superblock(sb_buf)?;
     let is_v5 = ctx.version == FormatVersion::V5;
 
-    callback(&FsEvent::Superblock {
+    emit(callback, &FsEvent::Superblock {
         block_size: ctx.block_size,
         ag_count: ctx.ag_count,
         inode_size: ctx.inode_size,
         root_ino: ctx.root_ino,
-    });
+    })?;
 
-    let max_ag = std::env::var("FXFSP_MAX_AG")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(ctx.ag_count);
-    let ag_limit = max_ag.min(ctx.ag_count);
-
-    for agno in 0..ag_limit {
-        callback(&FsEvent::AgBegin { ag_number: agno });
-        scan_ag(&mut engine, &ctx, agno, is_v5, &mut callback)?;
-        callback(&FsEvent::AgEnd { ag_number: agno });
+    for agno in 0..ctx.ag_count {
+        scan_ag(&mut engine, &ctx, agno, is_v5, callback)?;
     }
 
     Ok(())
@@ -70,7 +90,7 @@ fn scan_ag<F>(
     callback: &mut F,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     // ---- Read AGI header (at sector offset 2 within the AG) ----
     engine.set_phase("agi");
@@ -161,7 +181,7 @@ fn process_inode_chunk<F>(
     btree_dirs: &mut Vec<BtreeDirItem>,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     let start_agino = rec.start_ino();
 
@@ -184,7 +204,8 @@ where
         let inode_buf = &chunk_buf[inode_offset..];
         let info = parse_inode_core(inode_buf, abs_ino, is_v5, ctx.has_nrext64, ctx.inode_size)?;
 
-        callback(&FsEvent::InodeFound {
+        emit(callback, &FsEvent::InodeFound {
+            ag_number: agno,
             ino: info.ino,
             mode: info.mode,
             size: info.size,
@@ -198,7 +219,7 @@ where
             ctime_sec: info.ctime_sec,
             ctime_nsec: info.ctime_nsec,
             nblocks: info.nblocks,
-        });
+        })?;
 
         if info.is_dir() {
             handle_directory(inode_buf, &info, ctx, callback, dir_work, btree_dirs)?;
@@ -218,7 +239,7 @@ fn handle_directory<F>(
     btree_dirs: &mut Vec<BtreeDirItem>,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     match info.format {
         XFS_DINODE_FMT_LOCAL => {
@@ -262,7 +283,7 @@ fn phase2_dir_sweep<F>(
     callback: &mut F,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     // Build one request per directory extent.
     let mut requests: Vec<(u64, usize, u64)> = Vec::new();
@@ -293,6 +314,7 @@ where
     Ok(())
 }
 
+/// Rounds `value` up to the nearest multiple of `align`. `align` must be a power of two.
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }

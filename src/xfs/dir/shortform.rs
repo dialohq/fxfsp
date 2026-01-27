@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 use zerocopy::byteorder::big_endian::{U32, U64};
 
@@ -32,7 +34,7 @@ pub fn parse_shortform_dir<F>(
     callback: &mut F,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     if fork_buf.len() < 6 {
         return Err(FxfspError::Parse("shortform dir too small"));
@@ -56,20 +58,24 @@ where
     };
 
     // Emit "." entry (self).
-    callback(&FsEvent::DirEntry {
+    if callback(&FsEvent::DirEntry {
         parent_ino,
         child_ino: parent_ino,
         name: b".",
         file_type: 0,
-    });
+    }).is_break() {
+        return Err(FxfspError::Stopped);
+    }
 
     // Emit ".." entry (parent).
-    callback(&FsEvent::DirEntry {
+    if callback(&FsEvent::DirEntry {
         parent_ino,
         child_ino: hdr_parent_ino,
         name: b"..",
         file_type: 0,
-    });
+    }).is_break() {
+        return Err(FxfspError::Stopped);
+    }
 
     // Parse variable-length entries.
     let ino_size: usize = if use_8byte { 8 } else { 4 };
@@ -113,12 +119,14 @@ where
             u32::from_be_bytes(fork_buf[ino_start..ino_start + 4].try_into().unwrap()) as u64
         };
 
-        callback(&FsEvent::DirEntry {
+        if callback(&FsEvent::DirEntry {
             parent_ino,
             child_ino,
             name,
             file_type: ftype,
-        });
+        }).is_break() {
+            return Err(FxfspError::Stopped);
+        }
 
         offset = ino_start + ino_size;
     }

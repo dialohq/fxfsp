@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use crate::error::FxfspError;
 use crate::orchestrator;
 
@@ -12,16 +14,9 @@ pub enum FsEvent<'a> {
         inode_size: u16,
         root_ino: u64,
     },
-    /// Beginning to scan an allocation group.
-    AgBegin {
-        ag_number: u32,
-    },
-    /// Finished scanning an allocation group.
-    AgEnd {
-        ag_number: u32,
-    },
     /// An allocated inode was found.
     InodeFound {
+        ag_number: u32,
         ino: u64,
         mode: u16,
         size: u64,
@@ -51,10 +46,13 @@ pub enum FsEvent<'a> {
 /// sequential disk order (AG-by-AG, forward within each AG) for optimal
 /// HDD throughput.
 ///
+/// The callback returns [`ControlFlow::Continue(())`] to keep scanning or
+/// [`ControlFlow::Break(())`] to stop early. Early stop is not an error.
+///
 /// All errors are fatal -- any corrupt metadata aborts the scan immediately.
 pub fn scan<F>(device_path: &str, callback: F) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     orchestrator::run_scan(device_path, callback)
 }

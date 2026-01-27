@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 use zerocopy::byteorder::big_endian::{U16, U32, U64};
 
@@ -99,7 +101,7 @@ pub fn parse_dir_data_block<F>(
     callback: &mut F,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent),
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     if buf.len() < 4 {
         return Err(FxfspError::Parse("dir data block too small"));
@@ -161,12 +163,14 @@ where
 
         let ftype_size: usize = if ctx.has_ftype { 1 } else { 0 };
 
-        callback(&FsEvent::DirEntry {
+        if callback(&FsEvent::DirEntry {
             parent_ino,
             child_ino: inumber,
             name,
             file_type: ftype,
-        });
+        }).is_break() {
+            return Err(FxfspError::Stopped);
+        }
 
         // Compute entry size: round up to 8-byte boundary.
         // entry_size = 8 (ino) + 1 (namelen) + namelen + ftype_size + 2 (tag)

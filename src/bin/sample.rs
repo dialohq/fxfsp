@@ -1,4 +1,5 @@
 use std::env;
+use std::ops::ControlFlow;
 use std::process;
 use std::time::Instant;
 
@@ -45,51 +46,50 @@ fn main() {
     let mut dir_count: u64 = 0;
     let mut file_count: u64 = 0;
 
-    let result = scan(path, |event| match event {
-        FsEvent::Superblock { block_size, ag_count, inode_size, root_ino } => {
-            println!(
-                "Superblock: block_size={} ag_count={} inode_size={} root_ino={}",
-                block_size, ag_count, inode_size, root_ino
-            );
-        }
-        FsEvent::InodeFound { ino, mode, size, uid, gid, nlink, mtime_sec, nblocks, .. } => {
-            inode_count += 1;
-            match mode & 0o170000 {
-                0o040000 => dir_count += 1,
-                0o100000 => file_count += 1,
-                _ => {}
-            }
-            if inode_count % 1000 == 0 {
+    let result = scan(path, |event| {
+        match event {
+            FsEvent::Superblock { block_size, ag_count, inode_size, root_ino } => {
                 println!(
-                    "[inode #{:>9}] ino={:<12} {} uid={:<5} gid={:<5} nlink={:<4} size={:<12} blocks={:<8} mtime={}",
-                    inode_count, ino, mode_string(*mode), uid, gid, nlink, size, nblocks, mtime_sec
+                    "Superblock: block_size={} ag_count={} inode_size={} root_ino={}",
+                    block_size, ag_count, inode_size, root_ino
                 );
             }
-        }
-        FsEvent::DirEntry { parent_ino, child_ino, name, file_type } => {
-            dir_entry_count += 1;
-            if dir_entry_count % 1000 == 0 {
-                let name_str = String::from_utf8_lossy(name);
-                let ft = match file_type {
-                    1 => "REG",
-                    2 => "DIR",
-                    3 => "CHR",
-                    4 => "BLK",
-                    5 => "FIFO",
-                    6 => "SOCK",
-                    7 => "LNK",
-                    _ => "???",
-                };
-                println!(
-                    "[entry #{:>9}] parent={:<12} -> {:?} (ino={}, type={})",
-                    dir_entry_count, parent_ino, name_str, child_ino, ft
-                );
+            FsEvent::InodeFound { ag_number, ino, mode, size, uid, gid, nlink, mtime_sec, nblocks, .. } => {
+                inode_count += 1;
+                match mode & 0o170000 {
+                    0o040000 => dir_count += 1,
+                    0o100000 => file_count += 1,
+                    _ => {}
+                }
+                if inode_count % 1000 == 0 {
+                    println!(
+                        "[inode #{:>9}] ag={:<4} ino={:<12} {} uid={:<5} gid={:<5} nlink={:<4} size={:<12} blocks={:<8} mtime={}",
+                        inode_count, ag_number, ino, mode_string(*mode), uid, gid, nlink, size, nblocks, mtime_sec
+                    );
+                }
+            }
+            FsEvent::DirEntry { parent_ino, child_ino, name, file_type } => {
+                dir_entry_count += 1;
+                if dir_entry_count % 1000 == 0 {
+                    let name_str = String::from_utf8_lossy(name);
+                    let ft = match file_type {
+                        1 => "REG",
+                        2 => "DIR",
+                        3 => "CHR",
+                        4 => "BLK",
+                        5 => "FIFO",
+                        6 => "SOCK",
+                        7 => "LNK",
+                        _ => "???",
+                    };
+                    println!(
+                        "[entry #{:>9}] parent={:<12} -> {:?} (ino={}, type={})",
+                        dir_entry_count, parent_ino, name_str, child_ino, ft
+                    );
+                }
             }
         }
-        FsEvent::AgBegin { ag_number } => {
-            println!("--- AG {} ---", ag_number);
-        }
-        FsEvent::AgEnd { .. } => {}
+        ControlFlow::Continue(())
     });
 
     let elapsed = start.elapsed();
