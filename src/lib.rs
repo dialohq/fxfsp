@@ -1,9 +1,88 @@
-pub mod api;
+use std::ops::ControlFlow;
+
 pub mod error;
+#[cfg(feature = "io")]
 pub mod io;
-pub mod orchestrator;
+pub mod reader;
+mod scan;
 pub mod xfs;
 
-pub use api::{FsEvent, scan};
 pub use error::FxfspError;
+pub use reader::{IoPhase, IoReader};
+
+#[cfg(feature = "io")]
 pub use io::engine::{DiskProfile, detect_disk_profile_for_path};
+
+/// Events emitted during a filesystem scan.
+///
+/// `'a` borrows from the I/O buffer (e.g. directory entry names).
+pub enum FsEvent<'a> {
+    /// Superblock has been parsed.
+    Superblock {
+        block_size: u32,
+        ag_count: u32,
+        inode_size: u16,
+        root_ino: u64,
+    },
+    /// An allocated inode was found.
+    InodeFound {
+        ag_number: u32,
+        ino: u64,
+        mode: u16,
+        size: u64,
+        uid: u32,
+        gid: u32,
+        nlink: u32,
+        mtime_sec: u32,
+        mtime_nsec: u32,
+        atime_sec: u32,
+        atime_nsec: u32,
+        ctime_sec: u32,
+        ctime_nsec: u32,
+        nblocks: u64,
+    },
+    /// A directory entry.
+    DirEntry {
+        parent_ino: u64,
+        child_ino: u64,
+        name: &'a [u8],
+        file_type: u8,
+    },
+}
+
+/// Scan an XFS filesystem using a custom [`IoReader`].
+///
+/// Calls `callback` for each event discovered. Events are emitted in
+/// sequential disk order (AG-by-AG, forward within each AG) for optimal
+/// HDD throughput.
+///
+/// The callback returns [`ControlFlow::Continue(())`] to keep scanning or
+/// [`ControlFlow::Break(())`] to stop early. Early stop is not an error.
+///
+/// All errors are fatal -- any corrupt metadata aborts the scan immediately.
+pub fn scan_reader<R: IoReader, F>(reader: &mut R, mut callback: F) -> Result<(), FxfspError>
+where
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
+{
+    match scan::run_scan_inner(reader, &mut callback) {
+        Err(FxfspError::Stopped) => Ok(()),
+        other => other,
+    }
+}
+
+/// Scan an XFS filesystem at the given device/image path.
+///
+/// Convenience wrapper that opens the device with the built-in [`io::engine::IoEngine`]
+/// and optional CSV instrumentation (via `FXFSP_IO_LOG` / `FXFSP_IO_LOG_LIMIT`
+/// environment variables).
+///
+/// See [`scan_reader`] for the generic version.
+#[cfg(feature = "io")]
+pub fn scan<F>(device_path: &str, callback: F) -> Result<(), FxfspError>
+where
+    F: FnMut(&FsEvent) -> ControlFlow<()>,
+{
+    let engine = io::engine::IoEngine::open(device_path)?;
+    let mut reader = io::reader::MaybeInstrumented::from_env(engine)?;
+    scan_reader(&mut reader, callback)
+}

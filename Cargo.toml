@@ -3,19 +3,19 @@ name = "fxfsp"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["io"]
+io = ["dep:libc", "dep:aligned-vec", "dep:io-uring"]
+
 [dependencies]
 zerocopy = { version = "0.8", features = ["derive"] }
-aligned-vec = "0.6"
+aligned-vec = { version = "0.6", optional = true }
 thiserror = "2"
 crc32c = "0.6"
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
-
-[[bin]]
-name = "fxfsp-sample"
-path = "src/bin/sample.rs"
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

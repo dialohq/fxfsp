@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use fxfsp::{FsEvent, scan};
@@ -11,8 +12,6 @@ struct ScanResult {
     ag_count: u32,
     inode_size: u16,
     root_ino: u64,
-    ag_begins: Vec<u32>,
-    ag_ends: Vec<u32>,
     /// ino -> (mode, size, nlink)
     inodes: HashMap<u64, InodeRecord>,
     /// (parent_ino, name) -> (child_ino, file_type)
@@ -44,61 +43,60 @@ impl ScanResult {
             ag_count: 0,
             inode_size: 0,
             root_ino: 0,
-            ag_begins: Vec::new(),
-            ag_ends: Vec::new(),
             inodes: HashMap::new(),
             dir_entries: Vec::new(),
         };
 
-        scan(FIXTURE_PATH, |event| match event {
-            FsEvent::Superblock {
-                block_size,
-                ag_count,
-                inode_size,
-                root_ino,
-            } => {
-                result.block_size = *block_size;
-                result.ag_count = *ag_count;
-                result.inode_size = *inode_size;
-                result.root_ino = *root_ino;
+        scan(FIXTURE_PATH, |event| {
+            match event {
+                FsEvent::Superblock {
+                    block_size,
+                    ag_count,
+                    inode_size,
+                    root_ino,
+                } => {
+                    result.block_size = *block_size;
+                    result.ag_count = *ag_count;
+                    result.inode_size = *inode_size;
+                    result.root_ino = *root_ino;
+                }
+                FsEvent::InodeFound {
+                    ino,
+                    mode,
+                    size,
+                    nlink,
+                    uid,
+                    gid,
+                    nblocks,
+                    ..
+                } => {
+                    result.inodes.insert(
+                        *ino,
+                        InodeRecord {
+                            mode: *mode,
+                            size: *size,
+                            nlink: *nlink,
+                            uid: *uid,
+                            gid: *gid,
+                            nblocks: *nblocks,
+                        },
+                    );
+                }
+                FsEvent::DirEntry {
+                    parent_ino,
+                    child_ino,
+                    name,
+                    file_type,
+                } => {
+                    result.dir_entries.push(DirEntryRecord {
+                        parent_ino: *parent_ino,
+                        child_ino: *child_ino,
+                        name: String::from_utf8_lossy(name).to_string(),
+                        file_type: *file_type,
+                    });
+                }
             }
-            FsEvent::AgBegin { ag_number } => result.ag_begins.push(*ag_number),
-            FsEvent::AgEnd { ag_number } => result.ag_ends.push(*ag_number),
-            FsEvent::InodeFound {
-                ino,
-                mode,
-                size,
-                nlink,
-                uid,
-                gid,
-                nblocks,
-                ..
-            } => {
-                result.inodes.insert(
-                    *ino,
-                    InodeRecord {
-                        mode: *mode,
-                        size: *size,
-                        nlink: *nlink,
-                        uid: *uid,
-                        gid: *gid,
-                        nblocks: *nblocks,
-                    },
-                );
-            }
-            FsEvent::DirEntry {
-                parent_ino,
-                child_ino,
-                name,
-                file_type,
-            } => {
-                result.dir_entries.push(DirEntryRecord {
-                    parent_ino: *parent_ino,
-                    child_ino: *child_ino,
-                    name: String::from_utf8_lossy(name).to_string(),
-                    file_type: *file_type,
-                });
-            }
+            ControlFlow::Continue(())
         })
         .expect("scan should succeed");
 
@@ -149,23 +147,6 @@ fn superblock_has_valid_parameters() {
     assert_eq!(r.ag_count, 4, "expected 4 AGs");
     assert_eq!(r.inode_size, 512, "expected 512-byte inodes");
     assert!(r.root_ino > 0, "root inode should be nonzero");
-}
-
-// ---------------------------------------------------------------------------
-// Allocation group traversal
-// ---------------------------------------------------------------------------
-
-#[test]
-fn all_ags_are_visited_in_order() {
-    if skip_if_missing() { return; }
-    let r = ScanResult::collect();
-
-    assert_eq!(r.ag_begins.len(), r.ag_count as usize);
-    assert_eq!(r.ag_ends.len(), r.ag_count as usize);
-    assert_eq!(r.ag_begins, r.ag_ends, "AgBegin/AgEnd should pair up");
-
-    let expected: Vec<u32> = (0..r.ag_count).collect();
-    assert_eq!(r.ag_begins, expected, "AGs should be visited 0..ag_count in order");
 }
 
 // ---------------------------------------------------------------------------

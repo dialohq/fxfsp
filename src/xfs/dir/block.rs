@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 use zerocopy::byteorder::big_endian::{U16, U32, U64};
 
-use crate::api::FsEvent;
+use crate::FsEvent;
 use crate::error::FxfspError;
 use crate::xfs::superblock::{FormatVersion, FsContext};
 

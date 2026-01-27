@@ -1,9 +1,11 @@
 use std::ops::ControlFlow;
 
-use crate::api::FsEvent;
+use crate::FsEvent;
 use crate::error::FxfspError;
-use crate::io::aligned_buf::IO_ALIGN;
-use crate::io::engine::IoEngine;
+use crate::reader::{IoPhase, IoReader};
+
+/// Alignment for direct I/O reads (512 bytes covers all common block devices).
+const IO_ALIGN: usize = 512;
 use crate::xfs::ag::AgiInfo;
 use crate::xfs::bmbt::collect_bmbt_extents;
 use crate::xfs::btree::collect_inobt_records;
@@ -44,27 +46,13 @@ struct BtreeDirItem {
     data_fork_size: usize,
 }
 
-pub fn run_scan<F>(device_path: &str, mut callback: F) -> Result<(), FxfspError>
+pub(crate) fn run_scan_inner<R: IoReader, F>(engine: &mut R, callback: &mut F) -> Result<(), FxfspError>
 where
     F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
-    let result = run_scan_inner(device_path, &mut callback);
-    match result {
-        Err(FxfspError::Stopped) => Ok(()),
-        other => other,
-    }
-}
-
-fn run_scan_inner<F>(device_path: &str, callback: &mut F) -> Result<(), FxfspError>
-where
-    F: FnMut(&FsEvent) -> ControlFlow<()>,
-{
-    let mut engine = IoEngine::open(device_path)?;
-
     // Read superblock (always at byte offset 0, within first sector).
-    engine.set_phase("superblock");
     let sb_read_size = align_up(SUPERBLOCK_SIZE, IO_ALIGN);
-    let sb_buf = engine.read_at(0, sb_read_size)?;
+    let sb_buf = engine.read_at(0, sb_read_size, IoPhase::Superblock)?;
     let ctx = FsContext::from_superblock(sb_buf)?;
     let is_v5 = ctx.version == FormatVersion::V5;
 
@@ -76,14 +64,14 @@ where
     })?;
 
     for agno in 0..ctx.ag_count {
-        scan_ag(&mut engine, &ctx, agno, is_v5, callback)?;
+        scan_ag(engine, &ctx, agno, is_v5, callback)?;
     }
 
     Ok(())
 }
 
-fn scan_ag<F>(
-    engine: &mut IoEngine,
+fn scan_ag<R: IoReader, F>(
+    engine: &mut R,
     ctx: &FsContext,
     agno: u32,
     is_v5: bool,
@@ -93,16 +81,14 @@ where
     F: FnMut(&FsEvent) -> ControlFlow<()>,
 {
     // ---- Read AGI header (at sector offset 2 within the AG) ----
-    engine.set_phase("agi");
     let agi_offset = ctx.agi_byte_offset(agno);
     let agi_block_offset = agi_offset & !(ctx.block_size as u64 - 1);
     let agi_read_size = align_up(ctx.block_size as usize, IO_ALIGN);
-    let agi_buf = engine.read_at(agi_block_offset, agi_read_size)?;
+    let agi_buf = engine.read_at(agi_block_offset, agi_read_size, IoPhase::Agi)?;
     let agi_within_block = (agi_offset - agi_block_offset) as usize;
     let agi = AgiInfo::from_buf(&agi_buf[agi_within_block..], agno, ctx.version)?;
 
     // ---- Phase 1a: Collect all inobt records ----
-    engine.set_phase("inobt_walk");
     let mut inobt_records =
         collect_inobt_records(engine, ctx, agno, agi.inobt_root, agi.inobt_level)?;
 
@@ -142,14 +128,12 @@ where
         .map(|(idx, c)| (c.byte_offset, chunk_byte_len, idx))
         .collect();
 
-    engine.set_phase("inode_chunks");
     engine.coalesced_read_batch(&requests, |buf, idx| {
         let rec = &inobt_records[chunks[idx].rec_idx];
         process_inode_chunk(buf, rec, agno, ctx, is_v5, callback, &mut dir_work, &mut btree_dirs)
-    })?;
+    }, IoPhase::InodeChunks)?;
 
     // ---- Phase 1.5: Walk bmbt trees for btree-format directories ----
-    engine.set_phase("bmbt_walk");
     for item in btree_dirs {
         let extents = collect_bmbt_extents(engine, ctx, &item.fork_data, item.data_fork_size)?;
         if !extents.is_empty() {
@@ -162,7 +146,6 @@ where
 
     // ---- Phase 2: Directory sweep ----
     if !dir_work.is_empty() {
-        engine.set_phase("dir_extents");
         phase2_dir_sweep(engine, ctx, &dir_work, callback)?;
     }
 
@@ -276,8 +259,8 @@ where
 }
 
 /// Phase 2: Read directory extents via batch I/O and parse directory blocks.
-fn phase2_dir_sweep<F>(
-    engine: &mut IoEngine,
+fn phase2_dir_sweep<R: IoReader, F>(
+    engine: &mut R,
     ctx: &FsContext,
     dir_work: &[DirWorkItem],
     callback: &mut F,
@@ -309,7 +292,7 @@ where
             off += dir_blk_size;
         }
         Ok(())
-    })?;
+    }, IoPhase::DirExtents)?;
 
     Ok(())
 }

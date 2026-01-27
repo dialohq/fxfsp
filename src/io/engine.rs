@@ -1,5 +1,4 @@
 use std::ffi::CString;
-use std::io::Write;
 use std::os::fd::RawFd;
 
 use crate::error::FxfspError;
@@ -124,9 +123,6 @@ pub struct IoEngine {
     buf: AlignedBuf,
     device_size: u64,
     disk_profile: DiskProfile,
-    io_log: Option<std::io::BufWriter<std::fs::File>>,
-    io_log_remaining: usize,
-    phase: &'static str,
 }
 
 impl IoEngine {
@@ -152,27 +148,11 @@ impl IoEngine {
             return Err(FxfspError::Io(std::io::Error::last_os_error()));
         }
 
-        let (io_log, io_log_remaining) = if let Ok(path) = std::env::var("FXFSP_IO_LOG") {
-            let f = std::fs::File::create(&path).map_err(FxfspError::Io)?;
-            let mut w = std::io::BufWriter::new(f);
-            writeln!(w, "phase,offset,len").map_err(FxfspError::Io)?;
-            let limit = std::env::var("FXFSP_IO_LOG_LIMIT")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(usize::MAX);
-            (Some(w), limit)
-        } else {
-            (None, 0)
-        };
-
         Ok(Self {
             fd,
             buf: alloc_aligned(DEFAULT_BUF_SIZE),
             device_size: size as u64,
             disk_profile,
-            io_log,
-            io_log_remaining,
-            phase: "unknown",
         })
     }
 
@@ -184,22 +164,6 @@ impl IoEngine {
     /// Physical characteristics of the underlying block device.
     pub fn disk_profile(&self) -> &DiskProfile {
         &self.disk_profile
-    }
-
-    /// Set the current I/O phase label for logging.
-    pub fn set_phase(&mut self, phase: &'static str) {
-        self.phase = phase;
-    }
-
-    /// Log a single read operation to the CSV file (if enabled).
-    fn log_read(&mut self, offset: u64, len: usize) {
-        if self.io_log_remaining == 0 {
-            return;
-        }
-        if let Some(log) = &mut self.io_log {
-            let _ = writeln!(log, "{},{},{}", self.phase, offset, len);
-            self.io_log_remaining -= 1;
-        }
     }
 
     /// Read up to `len` bytes at byte offset `offset`.
@@ -218,8 +182,6 @@ impl IoEngine {
                 "read at or beyond device boundary",
             )));
         }
-
-        self.log_read(offset, clamped);
 
         // Grow buffer if needed.
         if self.buf.len() < clamped {
@@ -354,6 +316,29 @@ impl IoEngine {
     }
 }
 
+impl crate::reader::IoReader for IoEngine {
+    fn read_at(
+        &mut self,
+        offset: u64,
+        len: usize,
+        _phase: crate::reader::IoPhase,
+    ) -> Result<&[u8], FxfspError> {
+        self.read_at(offset, len)
+    }
+
+    fn coalesced_read_batch<T: Copy, F>(
+        &mut self,
+        requests: &[(u64, usize, T)],
+        on_complete: F,
+        _phase: crate::reader::IoPhase,
+    ) -> Result<(), FxfspError>
+    where
+        F: FnMut(&[u8], T) -> Result<(), FxfspError>,
+    {
+        self.coalesced_read_batch(requests, on_complete)
+    }
+}
+
 // ---- Batch read: io_uring on Linux, pread fallback elsewhere ----
 
 #[cfg(target_os = "linux")]
@@ -366,7 +351,7 @@ impl IoEngine {
     /// - `requests`: (byte_offset, byte_len, tag) triples
     /// - `on_complete`: called once per completed read with the data buffer and tag.
     ///   The buffer slice is only valid for the duration of the callback.
-    pub fn read_batch<T: Copy, F>(
+    fn read_batch<T: Copy, F>(
         &mut self,
         requests: &[(u64, usize, T)],
         mut on_complete: F,
@@ -419,7 +404,6 @@ impl IoEngine {
                         continue;
                     }
 
-                    self.log_read(offset, clamped);
 
                     let slot = free_slots.pop().unwrap();
                     slot_tags[slot] = Some(tag);
@@ -495,7 +479,7 @@ impl IoEngine {
     ///
     /// Fallback implementation using sequential pread() calls.  Same API as
     /// the Linux io_uring version so all callers are platform-agnostic.
-    pub fn read_batch<T: Copy, F>(
+    fn read_batch<T: Copy, F>(
         &mut self,
         requests: &[(u64, usize, T)],
         mut on_complete: F,
@@ -518,7 +502,6 @@ impl IoEngine {
                 continue;
             }
 
-            self.log_read(offset, clamped);
 
             let mut total = 0usize;
             while total < clamped {

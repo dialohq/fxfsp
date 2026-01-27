@@ -5,7 +5,7 @@
 use zerocopy::FromBytes;
 
 use crate::error::FxfspError;
-use crate::io::engine::IoEngine;
+use crate::reader::{IoPhase, IoReader};
 use crate::xfs::extent::{Extent, XfsBmbtRec, fsblock_to_byte};
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
@@ -26,8 +26,8 @@ fn bmbt_block_hdr_size(version: FormatVersion) -> usize {
 ///
 /// `fork_data` is a copy of the inode's data fork (starting at the bmdr root).
 /// `data_fork_size` is the byte size of the data fork area.
-pub fn collect_bmbt_extents(
-    engine: &mut IoEngine,
+pub fn collect_bmbt_extents<R: IoReader>(
+    engine: &mut R,
     ctx: &FsContext,
     fork_data: &[u8],
     data_fork_size: usize,
@@ -78,15 +78,15 @@ pub fn collect_bmbt_extents(
 }
 
 /// Recursively walk an on-disk bmbt block (long-form header).
-fn walk_bmbt_block(
-    engine: &mut IoEngine,
+fn walk_bmbt_block<R: IoReader>(
+    engine: &mut R,
     ctx: &FsContext,
     fsblock: u64,
     expected_level: u32,
     extents: &mut Vec<Extent>,
 ) -> Result<(), FxfspError> {
     let byte_offset = fsblock_to_byte(ctx, fsblock);
-    let buf = engine.read_at(byte_offset, ctx.block_size as usize)?;
+    let buf = engine.read_at(byte_offset, ctx.block_size as usize, IoPhase::BmbtWalk)?;
 
     if buf.len() < 8 {
         return Err(FxfspError::Parse("bmbt block too small"));

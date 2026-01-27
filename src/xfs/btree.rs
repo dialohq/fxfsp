@@ -2,7 +2,7 @@ use zerocopy::{FromBytes, Immutable, KnownLayout};
 use zerocopy::byteorder::big_endian::{U16, U32, U64};
 
 use crate::error::FxfspError;
-use crate::io::engine::IoEngine;
+use crate::reader::{IoPhase, IoReader};
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
 /// Short-form B-tree block magic: "IABT" (V4 inode allocation B-tree).
@@ -97,8 +97,8 @@ fn parse_btree_header(buf: &[u8], version: FormatVersion) -> Result<(u16, u16), 
 
 /// Walk the inode B-tree rooted at `root_block` (AG-relative) and collect all inobt records.
 /// This reads the entire tree before returning, collecting records into a Vec.
-pub fn collect_inobt_records(
-    engine: &mut IoEngine,
+pub fn collect_inobt_records<R: IoReader>(
+    engine: &mut R,
     ctx: &FsContext,
     agno: u32,
     root_block: u32,
@@ -112,8 +112,8 @@ pub fn collect_inobt_records(
     Ok(records)
 }
 
-fn walk_inobt_node(
-    engine: &mut IoEngine,
+fn walk_inobt_node<R: IoReader>(
+    engine: &mut R,
     ctx: &FsContext,
     agno: u32,
     block: u32,
@@ -121,7 +121,7 @@ fn walk_inobt_node(
     records: &mut Vec<XfsInobtRec>,
 ) -> Result<(), FxfspError> {
     let offset = ctx.ag_block_to_byte(agno, block);
-    let buf = engine.read_at(offset, ctx.block_size as usize)?;
+    let buf = engine.read_at(offset, ctx.block_size as usize, IoPhase::InobtWalk)?;
 
     let (blk_level, numrecs) = parse_btree_header(buf, ctx.version)?;
 
