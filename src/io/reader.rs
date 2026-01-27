@@ -8,6 +8,7 @@ pub struct InstrumentedReader<R> {
     inner: R,
     io_log: std::io::BufWriter<std::fs::File>,
     remaining: usize,
+    batch: u64,
 }
 
 impl<R> InstrumentedReader<R> {
@@ -15,11 +16,12 @@ impl<R> InstrumentedReader<R> {
     pub fn new(inner: R, log_path: &str, limit: usize) -> Result<Self, FxfspError> {
         let f = std::fs::File::create(log_path).map_err(FxfspError::Io)?;
         let mut w = std::io::BufWriter::new(f);
-        writeln!(w, "phase,offset,len").map_err(FxfspError::Io)?;
+        writeln!(w, "batch,phase,offset,len").map_err(FxfspError::Io)?;
         Ok(Self {
             inner,
             io_log: w,
             remaining: limit,
+            batch: 0,
         })
     }
 
@@ -27,13 +29,14 @@ impl<R> InstrumentedReader<R> {
         if self.remaining == 0 {
             return;
         }
-        let _ = writeln!(self.io_log, "{},{},{}", phase, offset, len);
+        let _ = writeln!(self.io_log, "{},{},{},{}", self.batch, phase, offset, len);
         self.remaining -= 1;
     }
 }
 
 impl<R: IoReader> IoReader for InstrumentedReader<R> {
     fn read_at(&mut self, offset: u64, len: usize, phase: IoPhase) -> Result<&[u8], FxfspError> {
+        self.batch += 1;
         self.log_read(phase, offset, len);
         self.inner.read_at(offset, len, phase)
     }
@@ -47,6 +50,7 @@ impl<R: IoReader> IoReader for InstrumentedReader<R> {
     where
         F: FnMut(&[u8], T) -> Result<(), FxfspError>,
     {
+        self.batch += 1;
         for &(offset, len, _) in requests {
             self.log_read(phase, offset, len);
         }
