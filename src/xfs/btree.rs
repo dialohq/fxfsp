@@ -96,7 +96,10 @@ fn parse_btree_header(buf: &[u8], version: FormatVersion) -> Result<(u16, u16), 
 }
 
 /// Walk the inode B-tree rooted at `root_block` (AG-relative) and collect all inobt records.
-/// This reads the entire tree before returning, collecting records into a Vec.
+///
+/// Uses level-by-level sorted batch reads: at each tree level the child block
+/// pointers are sorted by disk offset and read in one coalesced forward sweep,
+/// replacing the previous depth-first traversal which caused random seeks.
 pub fn collect_inobt_records<R: IoReader>(
     engine: &mut R,
     ctx: &FsContext,
@@ -104,72 +107,108 @@ pub fn collect_inobt_records<R: IoReader>(
     root_block: u32,
     level: u32,
 ) -> Result<Vec<XfsInobtRec>, FxfspError> {
-    let mut records = Vec::new();
     // AGI level is 1-based (number of levels), but bb_level in blocks is 0-based.
-    // Root node bb_level = level - 1.
     let root_level = level.saturating_sub(1);
-    walk_inobt_node(engine, ctx, agno, root_block, root_level, &mut records)?;
-    Ok(records)
-}
+    let hdr_size = btree_header_size(ctx.version);
+    let block_size = ctx.block_size as usize;
 
-fn walk_inobt_node<R: IoReader>(
-    engine: &mut R,
-    ctx: &FsContext,
-    agno: u32,
-    block: u32,
-    level: u32,
-    records: &mut Vec<XfsInobtRec>,
-) -> Result<(), FxfspError> {
-    let offset = ctx.ag_block_to_byte(agno, block);
-    let buf = engine.read_at(offset, ctx.block_size as usize, IoPhase::InobtWalk)?;
-
+    // Read root block.
+    let offset = ctx.ag_block_to_byte(agno, root_block);
+    let buf = engine.read_at(offset, block_size, IoPhase::InobtWalk)?;
     let (blk_level, numrecs) = parse_btree_header(buf, ctx.version)?;
-
-    if blk_level as u32 != level {
+    if blk_level as u32 != root_level {
         return Err(FxfspError::Parse("inobt level mismatch"));
     }
 
-    let hdr_size = btree_header_size(ctx.version);
-
-    if level == 0 {
-        // Leaf node: records are XfsInobtRec.
-        let rec_size = std::mem::size_of::<XfsInobtRec>();
-        for i in 0..numrecs as usize {
-            let start = hdr_size + i * rec_size;
-            let end = start + rec_size;
-            if end > buf.len() {
-                return Err(FxfspError::Parse("inobt leaf record out of bounds"));
-            }
-            let rec = XfsInobtRec::ref_from_prefix(&buf[start..])
-                .map_err(|_| FxfspError::Parse("failed to parse inobt record"))?
-                .0;
-            records.push(*rec);
-        }
-    } else {
-        // Interior node: keys followed by pointers.
-        // Keys are XfsInobtKey (4 bytes: startino) and pointers are U32 (AG block numbers).
-        // IMPORTANT: XFS lays out keys and pointers based on maxrecs (the maximum
-        // that fit in the block), NOT the current numrecs. The pointer array always
-        // starts at hdr_size + maxrecs * key_size.
-        let key_size = 4usize;
-        let ptr_size = 4usize;
-        let maxrecs = (ctx.block_size as usize - hdr_size) / (key_size + ptr_size);
-        let ptr_offset = hdr_size + maxrecs * key_size;
-
-        // Collect child block numbers first (before we reuse the engine buffer).
-        let mut child_blocks = Vec::with_capacity(numrecs as usize);
-        for i in 0..numrecs as usize {
-            let start = ptr_offset + i * 4;
-            let ptr = U32::ref_from_prefix(&buf[start..])
-                .map_err(|_| FxfspError::Parse("inobt ptr out of bounds"))?
-                .0;
-            child_blocks.push(ptr.get());
-        }
-
-        for child_block in child_blocks {
-            walk_inobt_node(engine, ctx, agno, child_block, level - 1, records)?;
-        }
+    if root_level == 0 {
+        return parse_inobt_leaf(buf, hdr_size, numrecs);
     }
 
-    Ok(())
+    // Root is interior — extract child pointers for the next level.
+    let mut current_blocks = extract_inobt_children(buf, hdr_size, numrecs, block_size)?;
+
+    // Walk down level by level with sorted batch reads.
+    for current_level in (0..root_level).rev() {
+        current_blocks.sort_unstable();
+
+        let requests: Vec<(u64, usize, usize)> = current_blocks
+            .iter()
+            .enumerate()
+            .map(|(idx, &block)| (ctx.ag_block_to_byte(agno, block), block_size, idx))
+            .collect();
+
+        if current_level == 0 {
+            // Leaf level — collect records.
+            let mut records = Vec::new();
+            engine.coalesced_read_batch(
+                &requests,
+                |buf, _idx| {
+                    let (_lvl, numrecs) = parse_btree_header(buf, ctx.version)?;
+                    let recs = parse_inobt_leaf(buf, hdr_size, numrecs)?;
+                    records.extend(recs);
+                    Ok(())
+                },
+                IoPhase::InobtWalk,
+            )?;
+            return Ok(records);
+        }
+
+        // Interior level — collect next level's block numbers.
+        let mut next_blocks = Vec::new();
+        engine.coalesced_read_batch(
+            &requests,
+            |buf, _idx| {
+                let (blk_level, numrecs) = parse_btree_header(buf, ctx.version)?;
+                if blk_level as u32 != current_level {
+                    return Err(FxfspError::Parse("inobt level mismatch"));
+                }
+                let children = extract_inobt_children(buf, hdr_size, numrecs, block_size)?;
+                next_blocks.extend(children);
+                Ok(())
+            },
+            IoPhase::InobtWalk,
+        )?;
+        current_blocks = next_blocks;
+    }
+
+    unreachable!("loop always returns at leaf level")
+}
+
+/// Parse inobt leaf records from a block buffer.
+fn parse_inobt_leaf(buf: &[u8], hdr_size: usize, numrecs: u16) -> Result<Vec<XfsInobtRec>, FxfspError> {
+    let rec_size = std::mem::size_of::<XfsInobtRec>();
+    let mut records = Vec::with_capacity(numrecs as usize);
+    for i in 0..numrecs as usize {
+        let start = hdr_size + i * rec_size;
+        let end = start + rec_size;
+        if end > buf.len() {
+            return Err(FxfspError::Parse("inobt leaf record out of bounds"));
+        }
+        let rec = XfsInobtRec::ref_from_prefix(&buf[start..])
+            .map_err(|_| FxfspError::Parse("failed to parse inobt record"))?
+            .0;
+        records.push(*rec);
+    }
+    Ok(records)
+}
+
+/// Extract child AG-block pointers from an inobt interior node.
+fn extract_inobt_children(buf: &[u8], hdr_size: usize, numrecs: u16, block_size: usize) -> Result<Vec<u32>, FxfspError> {
+    // Keys are XfsInobtKey (4 bytes) and pointers are U32 (AG block numbers).
+    // XFS lays out keys and pointers based on maxrecs (the maximum that fit
+    // in the block), NOT the current numrecs.
+    let key_size = 4usize;
+    let ptr_size = 4usize;
+    let maxrecs = (block_size - hdr_size) / (key_size + ptr_size);
+    let ptr_offset = hdr_size + maxrecs * key_size;
+
+    let mut children = Vec::with_capacity(numrecs as usize);
+    for i in 0..numrecs as usize {
+        let start = ptr_offset + i * ptr_size;
+        let ptr = U32::ref_from_prefix(&buf[start..])
+            .map_err(|_| FxfspError::Parse("inobt ptr out of bounds"))?
+            .0;
+        children.push(ptr.get());
+    }
+    Ok(children)
 }

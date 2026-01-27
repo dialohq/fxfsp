@@ -7,7 +7,7 @@ use crate::reader::{IoPhase, IoReader};
 /// Alignment for direct I/O reads (512 bytes covers all common block devices).
 const IO_ALIGN: usize = 512;
 use crate::xfs::ag::AgiInfo;
-use crate::xfs::bmbt::collect_bmbt_extents;
+use crate::xfs::bmbt::{BmbtDirInput, collect_all_bmbt_extents};
 use crate::xfs::btree::collect_inobt_records;
 use crate::xfs::dir::block::parse_dir_data_block;
 use crate::xfs::dir::shortform::parse_shortform_dir;
@@ -133,14 +133,21 @@ where
         process_inode_chunk(buf, rec, agno, ctx, is_v5, callback, &mut dir_work, &mut btree_dirs)
     }, IoPhase::InodeChunks)?;
 
-    // ---- Phase 1.5: Walk bmbt trees for btree-format directories ----
-    for item in btree_dirs {
-        let extents = collect_bmbt_extents(engine, ctx, &item.fork_data, item.data_fork_size)?;
-        if !extents.is_empty() {
-            dir_work.push(DirWorkItem {
+    // ---- Phase 1.5: Walk bmbt trees for btree-format directories (batched) ----
+    if !btree_dirs.is_empty() {
+        let inputs: Vec<BmbtDirInput> = btree_dirs
+            .iter()
+            .map(|item| BmbtDirInput {
                 ino: item.ino,
-                extents,
-            });
+                fork_data: &item.fork_data,
+                data_fork_size: item.data_fork_size,
+            })
+            .collect();
+        let bmbt_results = collect_all_bmbt_extents(engine, ctx, &inputs)?;
+        for (ino, extents) in bmbt_results {
+            if !extents.is_empty() {
+                dir_work.push(DirWorkItem { ino, extents });
+            }
         }
     }
 
