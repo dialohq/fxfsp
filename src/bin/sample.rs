@@ -37,6 +37,10 @@ fn main() {
     }
     let path = &args[1];
 
+    let max_ag: Option<u32> = env::var("FXFSP_MAX_AG")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
     let profile = detect_disk_profile_for_path(path);
     eprintln!("{}", profile);
 
@@ -55,6 +59,9 @@ fn main() {
                 );
             }
             FsEvent::InodeFound { ag_number, ino, mode, size, uid, gid, nlink, mtime_sec, nblocks, .. } => {
+                if max_ag.is_some_and(|limit| *ag_number >= limit) {
+                    return ControlFlow::Break(());
+                }
                 inode_count += 1;
                 match mode & 0o170000 {
                     0o040000 => dir_count += 1,
