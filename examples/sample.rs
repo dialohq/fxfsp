@@ -3,7 +3,10 @@ use std::ops::ControlFlow;
 use std::process;
 use std::time::Instant;
 
-use fxfsp::{FsEvent, IoEngine, MaybeInstrumented, detect_disk_profile_for_path, scan_reader};
+use fxfsp::{
+    parse_superblock, IoEngine, MaybeInstrumented, detect_disk_profile_for_path,
+    InodeInfo, FileExtentsInfo, DirEntryInfo,
+};
 
 fn mode_string(mode: u16) -> String {
     let file_type = match mode & 0o170000 {
@@ -94,7 +97,7 @@ fn main() {
         process::exit(1);
     });
 
-    let mut reader = MaybeInstrumented::from_env(engine).unwrap_or_else(|e| {
+    let reader = MaybeInstrumented::from_env(engine).unwrap_or_else(|e| {
         eprintln!("Failed to set up I/O reader: {e}", );
         process::exit(1);
     });
@@ -107,20 +110,25 @@ fn main() {
     let mut dir_count: u64 = 0;
     let mut file_count: u64 = 0;
 
-    let result = scan_reader(&mut reader, |event| {
-        match event {
-            FsEvent::Superblock { block_size, ag_count, inode_size, root_ino } => {
-                println!(
-                    "Superblock: block_size={} ag_count={} inode_size={} root_ino={}",
-                    block_size, ag_count, inode_size, root_ino
-                );
+    let result = (|| {
+        let (sb, mut scanner) = parse_superblock(reader)?;
+        println!(
+            "Superblock: block_size={} ag_count={} ag_blocks={} inode_size={} root_ino={}",
+            sb.block_size, sb.ag_count, sb.ag_blocks, sb.inode_size, sb.root_ino
+        );
+
+        while let Some(ag_result) = scanner.next_ag() {
+            let ag = ag_result?;
+            let ag_number = ag.ag_number();
+
+            if max_ag.is_some_and(|limit| ag_number >= limit) {
+                break;
             }
-            FsEvent::InodeFound { ag_number, ino, mode, size, uid, gid, nlink, mtime_sec, nblocks, .. } => {
-                if max_ag.is_some_and(|limit| *ag_number >= limit) {
-                    return ControlFlow::Break(());
-                }
+
+            // Phase 1: Scan inodes
+            let phase2 = ag.scan_inodes(|inode: &InodeInfo| {
                 inode_count += 1;
-                match mode & 0o170000 {
+                match inode.mode & 0o170000 {
                     0o040000 => dir_count += 1,
                     0o100000 => file_count += 1,
                     _ => {}
@@ -128,18 +136,25 @@ fn main() {
                 if inode_count % 1000 == 0 {
                     println!(
                         "[inode #{:>9}] ag={:<4} ino={:<12} {} uid={:<5} gid={:<5} nlink={:<4} size={:<12} blocks={:<8} mtime={}",
-                        inode_count, ag_number, ino, mode_string(*mode), uid, gid, nlink, size, nblocks, mtime_sec
+                        inode_count, inode.ag_number, inode.ino, mode_string(inode.mode),
+                        inode.uid, inode.gid, inode.nlink, inode.size, inode.nblocks, inode.mtime_sec
                     );
                 }
-            }
-            FsEvent::FileExtents { .. } => {
+                ControlFlow::Continue(())
+            })?;
+
+            // Phase 1.5: File extents (btree-format files)
+            let phase3 = phase2.scan_file_extents(|_fe: &FileExtentsInfo| {
                 // File extent maps available for later batch reads.
-            }
-            FsEvent::DirEntry { parent_ino, child_ino, name, file_type } => {
+                ControlFlow::Continue(())
+            })?;
+
+            // Phase 2: Directory entries
+            phase3.scan_dir_entries(|de: &DirEntryInfo| {
                 dir_entry_count += 1;
                 if dir_entry_count % 1000 == 0 {
-                    let name_str = String::from_utf8_lossy(name);
-                    let ft = match file_type {
+                    let name_str = String::from_utf8_lossy(de.name);
+                    let ft = match de.file_type {
                         1 => "REG",
                         2 => "DIR",
                         3 => "CHR",
@@ -151,13 +166,15 @@ fn main() {
                     };
                     println!(
                         "[entry #{:>9}] parent={:<12} -> {:?} (ino={}, type={})",
-                        dir_entry_count, parent_ino, name_str, child_ino, ft
+                        dir_entry_count, de.parent_ino, name_str, de.child_ino, ft
                     );
                 }
-            }
+                ControlFlow::Continue(())
+            })?;
         }
-        ControlFlow::Continue(())
-    });
+
+        Ok::<(), fxfsp::FxfspError>(())
+    })();
 
     let elapsed = start.elapsed();
 

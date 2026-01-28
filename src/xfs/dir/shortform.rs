@@ -3,8 +3,8 @@ use std::ops::ControlFlow;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 use zerocopy::byteorder::big_endian::{U32, U64};
 
-use crate::FsEvent;
 use crate::error::FxfspError;
+use crate::staged::DirEntryInfo;
 use crate::xfs::superblock::FsContext;
 
 /// Shortform directory header (when parent inode fits in 4 bytes).
@@ -26,22 +26,19 @@ pub struct XfsDirSfHdr8 {
 }
 
 /// Parse a shortform directory from the inode's data fork.
-/// Emits DirEntry events for each entry via the callback.
-pub fn parse_shortform_dir<F>(
+pub fn parse_shortform_dir_staged<F>(
     fork_buf: &[u8],
     parent_ino: u64,
     ctx: &FsContext,
     callback: &mut F,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent) -> ControlFlow<()>,
+    F: FnMut(&DirEntryInfo) -> ControlFlow<()>,
 {
     if fork_buf.len() < 6 {
         return Err(FxfspError::Parse("shortform dir too small"));
     }
 
-    // Determine if we use 4-byte or 8-byte inode numbers.
-    // i8count > 0 means 8-byte inodes are used.
     let i8count = fork_buf[1];
     let use_8byte = i8count > 0;
 
@@ -58,26 +55,27 @@ where
     };
 
     // Emit "." entry (self).
-    if callback(&FsEvent::DirEntry {
+    let dot = DirEntryInfo {
         parent_ino,
         child_ino: parent_ino,
         name: b".",
         file_type: 0,
-    }).is_break() {
+    };
+    if callback(&dot).is_break() {
         return Err(FxfspError::Stopped);
     }
 
     // Emit ".." entry (parent).
-    if callback(&FsEvent::DirEntry {
+    let dotdot = DirEntryInfo {
         parent_ino,
         child_ino: hdr_parent_ino,
         name: b"..",
         file_type: 0,
-    }).is_break() {
+    };
+    if callback(&dotdot).is_break() {
         return Err(FxfspError::Stopped);
     }
 
-    // Parse variable-length entries.
     let ino_size: usize = if use_8byte { 8 } else { 4 };
     let mut offset = hdr_size;
 
@@ -87,8 +85,7 @@ where
         }
 
         let namelen = fork_buf[offset] as usize;
-        // Skip the 2-byte offset field.
-        let name_start = offset + 1 + 2; // namelen(1) + offset(2)
+        let name_start = offset + 1 + 2;
         let name_end = name_start + namelen;
 
         if name_end > fork_buf.len() {
@@ -97,7 +94,6 @@ where
 
         let name = &fork_buf[name_start..name_end];
 
-        // ftype byte (only present if filesystem has ftype support).
         let ftype_size = if ctx.has_ftype { 1 } else { 0 };
         let ftype = if ctx.has_ftype {
             fork_buf[name_end]
@@ -105,7 +101,6 @@ where
             0
         };
 
-        // Inode number follows name (+ optional ftype).
         let ino_start = name_end + ftype_size;
         let child_ino = if use_8byte {
             if ino_start + 8 > fork_buf.len() {
@@ -119,12 +114,13 @@ where
             u32::from_be_bytes(fork_buf[ino_start..ino_start + 4].try_into().unwrap()) as u64
         };
 
-        if callback(&FsEvent::DirEntry {
+        let entry = DirEntryInfo {
             parent_ino,
             child_ino,
             name,
             file_type: ftype,
-        }).is_break() {
+        };
+        if callback(&entry).is_break() {
             return Err(FxfspError::Stopped);
         }
 

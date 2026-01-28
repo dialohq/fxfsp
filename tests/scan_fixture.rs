@@ -4,9 +4,10 @@ use std::ops::ControlFlow;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use fxfsp::{Extent, FsEvent, IoEngine, MaybeInstrumented, scan_reader};
-use fxfsp::xfs::extent::fsblock_to_byte;
-use fxfsp::xfs::superblock::FsContext;
+use fxfsp::{
+    Extent, FsContext, IoEngine, MaybeInstrumented, parse_superblock,
+    InodeInfo, FileExtentsInfo, DirEntryInfo,
+};
 
 const FIXTURE_PATH: &str = "tests/fixtures/test_v5.xfs";
 
@@ -14,13 +15,14 @@ const FIXTURE_PATH: &str = "tests/fixtures/test_v5.xfs";
 struct ScanResult {
     block_size: u32,
     ag_count: u32,
+    ag_blocks: u32,
     inode_size: u16,
     root_ino: u64,
     /// ino -> (mode, size, nlink)
     inodes: HashMap<u64, InodeRecord>,
     /// (parent_ino, name) -> (child_ino, file_type)
     dir_entries: Vec<DirEntryRecord>,
-    /// ino -> extents (from InodeFound inline + FileExtents events)
+    /// ino -> extents (from InodeInfo inline + FileExtentsInfo events)
     file_extents: HashMap<u64, Vec<Extent>>,
 }
 
@@ -47,6 +49,7 @@ impl ScanResult {
         let mut result = ScanResult {
             block_size: 0,
             ag_count: 0,
+            ag_blocks: 0,
             inode_size: 0,
             root_ino: 0,
             inodes: HashMap::new(),
@@ -55,66 +58,55 @@ impl ScanResult {
         };
 
         let engine = IoEngine::open(FIXTURE_PATH, 256 * 1024, 2 * 1024 * 1024).expect("failed to open fixture");
-        let mut reader = MaybeInstrumented::from_env(engine).expect("failed to create reader");
-        scan_reader(&mut reader, |event| {
-            match event {
-                FsEvent::Superblock {
-                    block_size,
-                    ag_count,
-                    inode_size,
-                    root_ino,
-                } => {
-                    result.block_size = *block_size;
-                    result.ag_count = *ag_count;
-                    result.inode_size = *inode_size;
-                    result.root_ino = *root_ino;
+        let reader = MaybeInstrumented::from_env(engine).expect("failed to create reader");
+
+        let (sb, mut scanner) = parse_superblock(reader).expect("failed to parse superblock");
+
+        result.block_size = sb.block_size;
+        result.ag_count = sb.ag_count;
+        result.ag_blocks = sb.ag_blocks;
+        result.inode_size = sb.inode_size;
+        result.root_ino = sb.root_ino;
+
+        while let Some(ag_result) = scanner.next_ag() {
+            let ag = ag_result.expect("failed to get AG");
+
+            // Phase 1: Inodes
+            let phase2 = ag.scan_inodes(|inode: &InodeInfo| {
+                result.inodes.insert(
+                    inode.ino,
+                    InodeRecord {
+                        mode: inode.mode,
+                        size: inode.size,
+                        nlink: inode.nlink,
+                        uid: inode.uid,
+                        gid: inode.gid,
+                        nblocks: inode.nblocks,
+                    },
+                );
+                if let Some(exts) = &inode.extents {
+                    result.file_extents.insert(inode.ino, exts.clone());
                 }
-                FsEvent::InodeFound {
-                    ino,
-                    mode,
-                    size,
-                    nlink,
-                    uid,
-                    gid,
-                    nblocks,
-                    extents,
-                    ..
-                } => {
-                    result.inodes.insert(
-                        *ino,
-                        InodeRecord {
-                            mode: *mode,
-                            size: *size,
-                            nlink: *nlink,
-                            uid: *uid,
-                            gid: *gid,
-                            nblocks: *nblocks,
-                        },
-                    );
-                    if let Some(exts) = extents {
-                        result.file_extents.insert(*ino, exts.clone());
-                    }
-                }
-                FsEvent::FileExtents { ino, extents } => {
-                    result.file_extents.insert(*ino, extents.clone());
-                }
-                FsEvent::DirEntry {
-                    parent_ino,
-                    child_ino,
-                    name,
-                    file_type,
-                } => {
-                    result.dir_entries.push(DirEntryRecord {
-                        parent_ino: *parent_ino,
-                        child_ino: *child_ino,
-                        name: String::from_utf8_lossy(name).to_string(),
-                        file_type: *file_type,
-                    });
-                }
-            }
-            ControlFlow::Continue(())
-        })
-        .expect("scan should succeed");
+                ControlFlow::Continue(())
+            }).expect("failed to scan inodes");
+
+            // Phase 1.5: File extents
+            let phase3 = phase2.scan_file_extents(|fe: &FileExtentsInfo| {
+                result.file_extents.insert(fe.ino, fe.extents.clone());
+                ControlFlow::Continue(())
+            }).expect("failed to scan extents");
+
+            // Phase 2: Directory entries
+            phase3.scan_dir_entries(|de: &DirEntryInfo| {
+                result.dir_entries.push(DirEntryRecord {
+                    parent_ino: de.parent_ino,
+                    child_ino: de.child_ino,
+                    name: String::from_utf8_lossy(de.name).to_string(),
+                    file_type: de.file_type,
+                });
+                ControlFlow::Continue(())
+            }).expect("failed to scan dirs");
+        }
 
         result
     }
@@ -163,6 +155,7 @@ fn superblock_has_valid_parameters() {
     assert_eq!(r.ag_count, 4, "expected 4 AGs");
     assert_eq!(r.inode_size, 512, "expected 512-byte inodes");
     assert!(r.root_ino > 0, "root inode should be nonzero");
+    assert!(r.ag_blocks > 0, "ag_blocks should be nonzero");
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +436,7 @@ fn directories_have_no_file_extents() {
 fn read_file_from_extents(extents: &[Extent], file_size: u64) -> Vec<u8> {
     let f = File::open(FIXTURE_PATH).expect("failed to open fixture for extent read");
 
-    // Parse the superblock to get FsContext (needed for fsblock → byte conversion).
+    // Parse the superblock to get FsContext (needed for computing byte offset).
     let mut sb_buf = vec![0u8; 4096];
     f.read_at(&mut sb_buf, 0).expect("failed to read superblock");
     let ctx = FsContext::from_superblock(&sb_buf).expect("failed to parse superblock");
@@ -456,7 +449,7 @@ fn read_file_from_extents(extents: &[Extent], file_size: u64) -> Vec<u8> {
         if remaining == 0 {
             break;
         }
-        let byte_offset = fsblock_to_byte(&ctx, ext.start_block);
+        let byte_offset = ext.start_byte(&ctx);
         let extent_bytes = ext.block_count * block_size;
         let to_read = remaining.min(extent_bytes) as usize;
 
@@ -599,4 +592,25 @@ fn total_dir_entry_count_matches_expected() {
         208,
         "expected exactly 208 directory entries total"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Extent decomposition (issue #1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extent_has_ag_number_and_ag_block() {
+    if skip_if_missing() { return; }
+    let r = ScanResult::collect();
+
+    let entry = r.find_entry(r.root_ino, "hello.txt").unwrap();
+    let extents = r.file_extents.get(&entry.child_ino)
+        .expect("hello.txt should have extents");
+
+    // Verify the extent has ag_number and ag_block fields
+    let ext = &extents[0];
+    // ag_number should be 0 for files in the first AG
+    assert_eq!(ext.ag_number, 0, "hello.txt should be in AG 0");
+    // ag_block should be non-zero (not at the start of the AG)
+    assert!(ext.ag_block > 0, "hello.txt ag_block should be > 0");
 }

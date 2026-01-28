@@ -18,28 +18,33 @@ pub struct XfsBmbtRec {
     pub l1: U64,
 }
 
-/// Unpacked extent.
+/// Unpacked extent with decomposed AG information.
 #[derive(Debug, Clone)]
 pub struct Extent {
     pub logical_offset: u64,
-    pub start_block: u64,
+    pub ag_number: u32,
+    pub ag_block: u32,
     pub block_count: u64,
     pub is_unwritten: bool,
 }
 
 impl XfsBmbtRec {
-    pub fn unpack(&self) -> Extent {
+    /// Unpack extent record with filesystem context to decompose fsblock into AG components.
+    pub fn unpack_with_context(&self, ctx: &FsContext) -> Extent {
         let l0 = self.l0.get();
         let l1 = self.l1.get();
 
         let is_unwritten = (l0 >> 63) != 0;
         let logical_offset = (l0 >> 9) & 0x003F_FFFF_FFFF_FFFF; // 54 bits
-        let start_block = ((l0 & 0x1FF) << 43) | (l1 >> 21); // 52 bits
+        let fsblock = ((l0 & 0x1FF) << 43) | (l1 >> 21); // 52 bits
         let block_count = l1 & 0x001F_FFFF; // 21 bits
+
+        let (ag_number, ag_block) = fsblock_to_ag(ctx, fsblock);
 
         Extent {
             logical_offset,
-            start_block,
+            ag_number,
+            ag_block,
             block_count,
             is_unwritten,
         }
@@ -48,7 +53,11 @@ impl XfsBmbtRec {
 
 /// Extract extent list from an inode's data fork (FMT_EXTENTS format).
 /// `fork_buf` is the data fork portion of the inode. `nextents` is the count.
-pub fn parse_extent_list(fork_buf: &[u8], nextents: u32) -> Result<Vec<Extent>, FxfspError> {
+pub fn parse_extent_list(
+    fork_buf: &[u8],
+    nextents: u32,
+    ctx: &FsContext,
+) -> Result<Vec<Extent>, FxfspError> {
     let rec_size = std::mem::size_of::<XfsBmbtRec>();
     let mut extents = Vec::with_capacity(nextents as usize);
 
@@ -60,10 +69,17 @@ pub fn parse_extent_list(fork_buf: &[u8], nextents: u32) -> Result<Vec<Extent>, 
         let rec = XfsBmbtRec::ref_from_prefix(&fork_buf[start..])
             .map_err(|_| FxfspError::Parse("failed to parse extent record"))?
             .0;
-        extents.push(rec.unpack());
+        extents.push(rec.unpack_with_context(ctx));
     }
 
     Ok(extents)
+}
+
+impl Extent {
+    /// Compute the starting byte offset of this extent on disk.
+    pub fn start_byte(&self, ctx: &FsContext) -> u64 {
+        ctx.ag_block_to_byte(self.ag_number, self.ag_block)
+    }
 }
 
 /// Convert an absolute filesystem block number to a byte offset on disk.

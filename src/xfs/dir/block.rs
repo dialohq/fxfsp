@@ -3,8 +3,8 @@ use std::ops::ControlFlow;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 use zerocopy::byteorder::big_endian::{U16, U32, U64};
 
-use crate::FsEvent;
 use crate::error::FxfspError;
+use crate::staged::DirEntryInfo;
 use crate::xfs::superblock::{FormatVersion, FsContext};
 
 /// V4 data block magic: "XD2D"
@@ -91,17 +91,14 @@ fn data_end_offset(buf: &[u8], magic: u32) -> usize {
 }
 
 /// Parse directory data entries from a data block.
-/// `buf` is a single directory block (block_size or dir_blk_size bytes).
-/// `parent_ino` is the inode owning this directory.
-/// Calls `callback` for each entry found.
-pub fn parse_dir_data_block<F>(
+pub fn parse_dir_data_block_staged<F>(
     buf: &[u8],
     parent_ino: u64,
     ctx: &FsContext,
     callback: &mut F,
 ) -> Result<(), FxfspError>
 where
-    F: FnMut(&FsEvent) -> ControlFlow<()>,
+    F: FnMut(&DirEntryInfo) -> ControlFlow<()>,
 {
     if buf.len() < 4 {
         return Err(FxfspError::Parse("dir data block too small"));
@@ -118,12 +115,9 @@ where
     let mut offset = hdr_size;
 
     while offset + 6 <= data_end {
-        // Each entry starts with either a used entry or a free (unused) entry.
-        // Free entries have a 2-byte freetag (0xffff) + 2-byte length.
         let freetag = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
 
         if freetag == XFS_DIR2_DATA_FREE_TAG {
-            // Unused entry: 2-byte tag + 2-byte length.
             let length = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
             if length == 0 || offset + length > data_end {
                 break;
@@ -131,14 +125,6 @@ where
             offset += length;
             continue;
         }
-
-        // Used entry layout:
-        // - U64 inumber (8 bytes)
-        // - u8 namelen (1 byte)
-        // - name[namelen]
-        // - optional ftype (1 byte if has_ftype)
-        // - padding to 8-byte boundary
-        // - U16 tag (2 bytes, offset of this entry from block start)
 
         if offset + 9 > data_end {
             break;
@@ -163,17 +149,16 @@ where
 
         let ftype_size: usize = if ctx.has_ftype { 1 } else { 0 };
 
-        if callback(&FsEvent::DirEntry {
+        let entry = DirEntryInfo {
             parent_ino,
             child_ino: inumber,
             name,
             file_type: ftype,
-        }).is_break() {
+        };
+        if callback(&entry).is_break() {
             return Err(FxfspError::Stopped);
         }
 
-        // Compute entry size: round up to 8-byte boundary.
-        // entry_size = 8 (ino) + 1 (namelen) + namelen + ftype_size + 2 (tag)
         let raw_size = 8 + 1 + namelen + ftype_size + 2;
         let padded_size = (raw_size + 7) & !7;
         offset += padded_size;

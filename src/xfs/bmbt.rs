@@ -65,7 +65,7 @@ pub fn collect_all_bmbt_extents<R: IoReader>(
 
         if level == 0 {
             // Leaf-level root: extent records inline in the fork.
-            let extents = parse_bmbt_leaf_inline(dir.fork_data, numrecs)?;
+            let extents = parse_bmbt_leaf_inline(dir.fork_data, numrecs, ctx)?;
             if !extents.is_empty() {
                 results.entry(dir.ino).or_default().extend(extents);
             }
@@ -146,7 +146,7 @@ pub fn collect_all_bmbt_extents<R: IoReader>(
                         let rec = <XfsBmbtRec as FromBytes>::ref_from_prefix(&buf[offset..])
                             .map_err(|_| FxfspError::Parse("bmbt leaf record parse failed"))?
                             .0;
-                        results.entry(owner_ino).or_default().push(rec.unpack());
+                        results.entry(owner_ino).or_default().push(rec.unpack_with_context(ctx));
                     }
                 } else {
                     // Interior: extract child fsblock pointers.
@@ -181,7 +181,7 @@ pub fn collect_all_bmbt_extents<R: IoReader>(
 }
 
 /// Parse extent records from an inline leaf-level bmbt root (in the inode fork).
-fn parse_bmbt_leaf_inline(fork_data: &[u8], numrecs: usize) -> Result<Vec<Extent>, FxfspError> {
+fn parse_bmbt_leaf_inline(fork_data: &[u8], numrecs: usize, ctx: &FsContext) -> Result<Vec<Extent>, FxfspError> {
     let mut extents = Vec::with_capacity(numrecs);
     for i in 0..numrecs {
         let offset = 4 + i * 16;
@@ -191,7 +191,7 @@ fn parse_bmbt_leaf_inline(fork_data: &[u8], numrecs: usize) -> Result<Vec<Extent
         let rec = <XfsBmbtRec as FromBytes>::ref_from_prefix(&fork_data[offset..])
             .map_err(|_| FxfspError::Parse("bmbt leaf record parse failed"))?
             .0;
-        extents.push(rec.unpack());
+        extents.push(rec.unpack_with_context(ctx));
     }
     Ok(extents)
 }
